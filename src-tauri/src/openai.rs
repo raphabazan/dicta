@@ -6,6 +6,22 @@ pub struct TranscriptionResponse {
     pub text: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VerboseTranscriptionResponse {
+    pub text: String,
+    #[serde(default)]
+    pub words: Vec<WordSegment>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WordSegment {
+    pub word: String,
+    pub start: f64,
+    pub end: f64,
+    #[serde(default)]
+    pub probability: Option<f64>,
+}
+
 pub struct OpenAIClient {
     api_key: String,
     client: reqwest::Client,
@@ -19,17 +35,19 @@ impl OpenAIClient {
         }
     }
 
-    /// Transcribe audio using Whisper API (simpler than Realtime API for MVP)
+    /// Transcribe audio using Whisper API with confidence filtering
     pub async fn transcribe_audio(&self, audio_data: Vec<f32>, sample_rate: u32) -> Result<String, String> {
         println!("🔄 Transcribing audio... ({} samples at {}Hz)", audio_data.len(), sample_rate);
 
         // Convert f32 audio to WAV format
         let wav_data = self.audio_to_wav(audio_data, sample_rate)?;
 
-        // Call Whisper API with Portuguese language hint
+        // Call Whisper API with Portuguese language hint and verbose_json for word-level confidence
         let form = reqwest::multipart::Form::new()
             .text("model", "whisper-1")
             .text("language", "pt")
+            .text("response_format", "verbose_json")
+            .text("timestamp_granularities[]", "word")
             .part(
                 "file",
                 reqwest::multipart::Part::bytes(wav_data)
@@ -52,13 +70,37 @@ impl OpenAIClient {
             return Err(format!("API error: {}", error_text));
         }
 
-        let result: TranscriptionResponse = response
+        let result: VerboseTranscriptionResponse = response
             .json()
             .await
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-        println!("✅ Transcription: {}", result.text);
-        Ok(result.text)
+        // Filter words by confidence threshold (0.7 = 70%)
+        let confidence_threshold = 0.7;
+        let filtered_words: Vec<String> = result.words
+            .iter()
+            .filter(|w| {
+                if let Some(prob) = w.probability {
+                    if prob < confidence_threshold {
+                        println!("⚠️ Low confidence ({:.2}%): '{}'", prob * 100.0, w.word);
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    true // Keep if no probability (fallback)
+                }
+            })
+            .map(|w| w.word.clone())
+            .collect();
+
+        let filtered_text = filtered_words.join(" ");
+
+        println!("📊 Original: {} words", result.words.len());
+        println!("📊 Filtered: {} words (threshold: {:.0}%)", filtered_words.len(), confidence_threshold * 100.0);
+        println!("✅ Transcription: {}", filtered_text);
+
+        Ok(filtered_text)
     }
 
     /// Post-process text with GPT-4o-mini

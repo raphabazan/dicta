@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Recording Widget</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 125px;
+      height: 40px;
+      overflow: hidden;
+      background: transparent;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+
+    .widget {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: rgba(17, 24, 39, 0.95);
+      border: 1px solid rgba(239, 68, 68, 0.5);
+      border-radius: 20px;
+      padding: 0 8px;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+      backdrop-filter: blur(8px);
+      cursor: move;
+      user-select: none;
+    }
+
+    .drag-area {
+      flex: 1;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: move;
+    }
+
+    .indicator {
+      width: 8px;
+      height: 8px;
+      background: #ef4444;
+      border-radius: 50%;
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    .btn {
+      width: 24px;
+      height: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: none;
+      border-radius: 50%;
+      cursor: pointer;
+      transition: all 0.2s;
+      padding: 0;
+    }
+
+    .btn:hover {
+      transform: scale(1.1);
+    }
+
+    .btn-cancel {
+      background: transparent;
+    }
+
+    .btn-cancel:hover {
+      background: rgba(107, 114, 128, 0.5);
+    }
+
+    .btn-stop {
+      background: #ef4444;
+    }
+
+    .btn-stop:hover {
+      background: #dc2626;
+    }
+
+    .icon-cancel {
+      width: 12px;
+      height: 12px;
+    }
+
+    .icon-stop {
+      width: 8px;
+      height: 8px;
+      background: white;
+      border-radius: 2px;
+    }
+  </style>
+</head>
+<body>
+  <div class="widget" id="widget">
+    <button class="btn btn-cancel" id="cancelBtn" title="Cancel">
+      <svg class="icon-cancel" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M1 1L11 11M1 11L11 1" stroke="white" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+    </button>
+    <div class="drag-area" id="dragArea">
+      <div class="indicator"></div>
+    </div>
+    <button class="btn btn-stop" id="stopBtn" title="Stop & Send">
+      <div class="icon-stop"></div>
+    </button>
+  </div>
+
+  <script type="module">
+    import { invoke } from '@tauri-apps/api/core';
+    import { emit } from '@tauri-apps/api/event';
+    import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+
+    const cancelBtn = document.getElementById('cancelBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const dragArea = document.getElementById('dragArea');
+    const widget = document.getElementById('widget');
+    const currentWindow = getCurrentWebviewWindow();
+
+    // Make widget draggable
+    let isDragging = false;
+    let startX = 0;
+    let startY = 0;
+
+    dragArea.addEventListener('mousedown', (e) => {
+      isDragging = true;
+      startX = e.screenX;
+      startY = e.screenY;
+      widget.style.cursor = 'grabbing';
+      e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', async (e) => {
+      if (!isDragging) return;
+
+      const deltaX = e.screenX - startX;
+      const deltaY = e.screenY - startY;
+
+      const pos = await currentWindow.outerPosition();
+      await currentWindow.setPosition({ x: pos.x + deltaX, y: pos.y + deltaY });
+
+      startX = e.screenX;
+      startY = e.screenY;
+    });
+
+    document.addEventListener('mouseup', () => {
+      if (isDragging) {
+        isDragging = false;
+        widget.style.cursor = 'move';
+      }
+    });
+
+    cancelBtn.addEventListener('click', async () => {
+      try {
+        await invoke('cancel_recording');
+        await emit('recording-cancelled');
+        await currentWindow.hide();
+      } catch (error) {
+        console.error('Failed to cancel:', error);
+      }
+    });
+
+    stopBtn.addEventListener('click', async () => {
+      try {
+        await emit('widget-stop-recording');
+        await currentWindow.hide();
+      } catch (error) {
+        console.error('Failed to stop:', error);
+      }
+    });
+  </script>
+</body>
+</html>

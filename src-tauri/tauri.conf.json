@@ -26,6 +26,35 @@
         "resizable": true,
         "fullscreen": false,
         "visible": false
+      },
+      {
+        "label": "recording-widget",
+        "title": "Recording",
+        "url": "widget.html",
+        "width": 125,
+        "height": 40,
+        "resizable": false,
+        "fullscreen": false,
+        "visible": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "transparent": true,
+        "dragDropEnabled": false
+      },
+      {
+        "label": "warning-widget",
+        "title": "Warning",
+        "url": "warning.html",
+        "width": 280,
+        "height": 60,
+        "resizable": false,
+        "fullscreen": false,
+        "visible": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "transparent": true
       }
     ],
     "security": {
@@ -34,20 +63,22 @@
         {
           "identifier": "main-capability",
           "description": "Capability for main window",
-          "windows": ["main"],
+          "windows": ["main", "recording-widget", "warning-widget"],
           "permissions": [
             "core:event:allow-listen",
             "core:event:allow-unlisten",
             "core:event:allow-emit",
             "core:window:allow-show",
             "core:window:allow-hide",
+            "core:window:allow-set-position",
+            "core:window:allow-set-always-on-top",
             "core:tray:allow-new",
             "core:tray:allow-set-icon",
             "core:tray:allow-set-menu",
             "core:tray:allow-set-tooltip"
           ],
           "commands": {
-            "allow": ["start_recording_audio", "stop_recording_audio"]
+            "allow": ["start_recording_audio", "stop_recording_audio", "cancel_recording"]
           }
         }
       ]

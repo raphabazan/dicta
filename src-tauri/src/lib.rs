@@ -3,7 +3,7 @@ mod openai;
 mod realtime;
 mod db;
 
-use tauri::{Emitter, Manager, State, AppHandle};
+use tauri::{Emitter, Manager, State, AppHandle, PhysicalPosition};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, GlobalShortcutExt};
@@ -90,16 +90,37 @@ struct AppState {
     current_session_transcript: Arc<Mutex<String>>, // Accumulate transcript for current session
     last_transcription: Arc<Mutex<Option<String>>>,
     paste_in_progress: Arc<Mutex<bool>>,
+    recording_start_time: Arc<Mutex<Option<Instant>>>,
 }
 
 #[tauri::command]
-async fn start_recording_audio(state: State<'_, AppState>) -> Result<String, String> {
+async fn cancel_recording(state: State<'_, AppState>) -> Result<String, String> {
+    let mut is_recording = state.is_recording.lock().unwrap();
+    if !*is_recording {
+        return Err("Not recording".to_string());
+    }
+
+    println!("❌ Cancelling recording...");
+
+    // For Whisper mode, just stop recording without processing
+    let recorder = state.audio_recorder.lock().unwrap();
+    let _ = recorder.stop_recording(); // Discard audio data
+    *is_recording = false;
+
+    Ok("Recording cancelled".to_string())
+}
+
+#[tauri::command]
+async fn start_recording_audio(state: State<'_, AppState>, app: AppHandle) -> Result<String, String> {
     let mut is_recording = state.is_recording.lock().unwrap();
     if *is_recording {
         return Err("Already recording".to_string());
     }
 
     println!("🎤 Starting audio recording...");
+
+    // Set recording start time
+    *state.recording_start_time.lock().unwrap() = Some(Instant::now());
 
     // Get selected microphone from settings
     let selected_mic = state.database.load_setting("selected_microphone")
@@ -109,6 +130,106 @@ async fn start_recording_audio(state: State<'_, AppState>) -> Result<String, Str
     let recorder = state.audio_recorder.lock().unwrap();
     recorder.start_recording(selected_mic)?;
     *is_recording = true;
+
+    // Spawn timer task for Whisper mode
+    let is_recording_flag = state.is_recording.clone();
+    let recording_start = state.recording_start_time.clone();
+    let app_clone = app.clone();
+
+    tokio::spawn(async move {
+        let mut warning_shown = false;
+        let mut auto_stop_triggered = false;
+
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+            if !*is_recording_flag.lock().unwrap() {
+                break;
+            }
+
+            if let Some(start_time) = *recording_start.lock().unwrap() {
+                let elapsed = start_time.elapsed();
+
+                // Show warning at 5 minutes
+                if elapsed >= Duration::from_secs(5 * 60) && !warning_shown {
+                    warning_shown = true;
+                    println!("⚠️ [WHISPER] 5 seconds elapsed, showing warning...");
+                    println!("⚠️ [WHISPER] Elapsed time: {:?}", elapsed);
+
+                    if let Some(warning) = app_clone.get_webview_window("warning-widget") {
+                        println!("⚠️ [WHISPER] Found warning widget");
+
+                        if let Some(widget) = app_clone.get_webview_window("recording-widget") {
+                            println!("⚠️ [WHISPER] Found recording widget");
+                            if let Ok(widget_pos) = widget.outer_position() {
+                                let warning_x = widget_pos.x - 77;
+                                let warning_y = widget_pos.y - 70;
+                                println!("⚠️ [WHISPER] Positioning warning at x:{}, y:{}", warning_x, warning_y);
+                                match warning.set_position(PhysicalPosition::new(warning_x, warning_y)) {
+                                    Ok(_) => println!("⚠️ [WHISPER] ✅ Position set successfully"),
+                                    Err(e) => println!("⚠️ [WHISPER] ❌ Failed to set position: {}", e),
+                                }
+                            }
+                        } else {
+                            println!("⚠️ [WHISPER] ❌ Recording widget not found for positioning");
+                        }
+
+                        match warning.show() {
+                            Ok(_) => {
+                                println!("⚠️ [WHISPER] ✅ Warning shown successfully");
+
+                                // Auto-hide warning after 4 seconds
+                                let warning_clone = warning.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+                                    println!("⚠️ [WHISPER] Auto-hiding warning after 4 seconds");
+                                    match warning_clone.hide() {
+                                        Ok(_) => println!("⚠️ [WHISPER] ✅ Warning auto-hidden successfully"),
+                                        Err(e) => println!("⚠️ [WHISPER] ❌ Failed to auto-hide warning: {}", e),
+                                    }
+                                });
+                            },
+                            Err(e) => println!("⚠️ [WHISPER] ❌ Failed to show warning: {}", e),
+                        }
+                    } else {
+                        println!("⚠️ [WHISPER] ❌ Warning widget not found!");
+                    }
+                }
+
+                // Auto-stop at 6 minutes
+                if elapsed >= Duration::from_secs(6 * 60) && !auto_stop_triggered {
+                    auto_stop_triggered = true;
+                    println!("⏰ [WHISPER] 6 minutes limit reached, auto-stopping...");
+                    println!("⏰ [WHISPER] Elapsed time: {:?}", elapsed);
+
+                    // DON'T set is_recording = false here - let the frontend's stopRecording() do it
+
+                    if let Some(window) = app_clone.get_webview_window("main") {
+                        println!("⏰ [WHISPER] Found main window, emitting widget-stop-recording event");
+                        match window.emit("widget-stop-recording", ()) {
+                            Ok(_) => println!("⏰ [WHISPER] ✅ Event emitted successfully"),
+                            Err(e) => println!("⏰ [WHISPER] ❌ Failed to emit event: {}", e),
+                        }
+                    } else {
+                        println!("⏰ [WHISPER] ❌ Main window not found!");
+                    }
+
+                    // Hide recording widget
+                    if let Some(widget) = app_clone.get_webview_window("recording-widget") {
+                        println!("⏰ [WHISPER] Found recording widget, hiding it");
+                        match widget.hide() {
+                            Ok(_) => println!("⏰ [WHISPER] ✅ Widget hidden successfully"),
+                            Err(e) => println!("⏰ [WHISPER] ❌ Failed to hide widget: {}", e),
+                        }
+                    } else {
+                        println!("⏰ [WHISPER] ❌ Recording widget not found!");
+                    }
+
+                    // DON'T break - let the loop continue until frontend calls stop
+                }
+            }
+        }
+    });
 
     Ok("Recording started".to_string())
 }
@@ -246,6 +367,10 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
 
     println!("🎤 Starting realtime transcription...");
     *is_recording = true;
+
+    // Set recording start time
+    *state.recording_start_time.lock().unwrap() = Some(Instant::now());
+
     drop(is_recording);
 
     // Reset current session transcript
@@ -261,6 +386,7 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
     let realtime_client = state.realtime_client.clone();
     let current_session_transcript = state.current_session_transcript.clone();
     let is_recording_flag = state.is_recording.clone();
+    let recording_start = state.recording_start_time.clone();
     let app_handle = app.clone();
 
     tokio::spawn(async move {
@@ -333,6 +459,7 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
 
                 // Clone for the event listener
                 let is_recording_flag_check = is_recording_flag.clone();
+                let app_for_listen = app_handle.clone();
 
                 // Listen for transcription events with periodic stop check
                 let listen_task = tokio::spawn(async move {
@@ -345,7 +472,7 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
                                 current_session_transcript.lock().unwrap().push_str(&delta.delta);
 
                                 // Emit delta to frontend for live display
-                                if let Some(window) = app_handle.get_webview_window("main") {
+                                if let Some(window) = app_for_listen.get_webview_window("main") {
                                     let _ = window.emit("transcription-delta", delta.delta.clone());
                                 }
                             }
@@ -357,8 +484,12 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
                         .await;
                 });
 
-                // Poll for stop signal
-                println!("👀 Monitoring for stop signal...");
+                // Poll for stop signal and check time limit
+                println!("👀 Monitoring for stop signal and time limit...");
+                let app_for_warning = app_handle.clone();
+                let mut warning_shown = false;
+                let mut auto_stop_triggered = false;
+
                 loop {
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -367,6 +498,91 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
                     if !still_recording {
                         println!("🛑 Stop signal detected (is_recording = false), waiting for last transcriptions...");
                         break;
+                    }
+
+                    // Check recording duration
+                    if let Some(start_time) = *recording_start.lock().unwrap() {
+                        let elapsed = start_time.elapsed();
+
+                        // Show warning at 5 minutes
+                        if elapsed >= Duration::from_secs(5 * 60) && !warning_shown {
+                            warning_shown = true;
+                            println!("⚠️ [REALTIME] 5 seconds elapsed, showing warning...");
+                            println!("⚠️ [REALTIME] Elapsed time: {:?}", elapsed);
+
+                            if let Some(warning) = app_for_warning.get_webview_window("warning-widget") {
+                                println!("⚠️ [REALTIME] Found warning widget");
+
+                                if let Some(widget) = app_for_warning.get_webview_window("recording-widget") {
+                                    println!("⚠️ [REALTIME] Found recording widget");
+                                    if let Ok(widget_pos) = widget.outer_position() {
+                                        // Position warning above widget
+                                        let warning_x = widget_pos.x - 77; // Center warning above widget
+                                        let warning_y = widget_pos.y - 70; // 10px above widget
+                                        println!("⚠️ [REALTIME] Positioning warning at x:{}, y:{}", warning_x, warning_y);
+                                        match warning.set_position(PhysicalPosition::new(warning_x, warning_y)) {
+                                            Ok(_) => println!("⚠️ [REALTIME] ✅ Position set successfully"),
+                                            Err(e) => println!("⚠️ [REALTIME] ❌ Failed to set position: {}", e),
+                                        }
+                                    }
+                                } else {
+                                    println!("⚠️ [REALTIME] ❌ Recording widget not found for positioning");
+                                }
+
+                                match warning.show() {
+                                    Ok(_) => {
+                                        println!("⚠️ [REALTIME] ✅ Warning shown successfully");
+
+                                        // Auto-hide warning after 4 seconds
+                                        let warning_clone = warning.clone();
+                                        tokio::spawn(async move {
+                                            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+                                            println!("⚠️ [REALTIME] Auto-hiding warning after 4 seconds");
+                                            match warning_clone.hide() {
+                                                Ok(_) => println!("⚠️ [REALTIME] ✅ Warning auto-hidden successfully"),
+                                                Err(e) => println!("⚠️ [REALTIME] ❌ Failed to auto-hide warning: {}", e),
+                                            }
+                                        });
+                                    },
+                                    Err(e) => println!("⚠️ [REALTIME] ❌ Failed to show warning: {}", e),
+                                }
+                            } else {
+                                println!("⚠️ [REALTIME] ❌ Warning widget not found!");
+                            }
+                        }
+
+                        // Auto-stop at 6 minutes
+                        if elapsed >= Duration::from_secs(6 * 60) && !auto_stop_triggered {
+                            auto_stop_triggered = true;
+                            println!("⏰ [REALTIME] 6 minutes limit reached, auto-stopping...");
+                            println!("⏰ [REALTIME] Elapsed time: {:?}", elapsed);
+
+                            // DON'T set is_recording = false here - let the frontend's stopRecording() do it
+                            // This prevents the "Not recording" error
+
+                            // Emit event to frontend to trigger full stop (which handles transcription save, paste, etc)
+                            if let Some(window) = app_for_warning.get_webview_window("main") {
+                                println!("⏰ [REALTIME] Emitting widget-stop-recording event to frontend");
+                                match window.emit("widget-stop-recording", ()) {
+                                    Ok(_) => println!("⏰ [REALTIME] ✅ Event emitted successfully"),
+                                    Err(e) => println!("⏰ [REALTIME] ❌ Failed to emit event: {}", e),
+                                }
+                            }
+
+                            // Hide recording widget
+                            if let Some(widget) = app_for_warning.get_webview_window("recording-widget") {
+                                println!("⏰ [REALTIME] Found recording widget, hiding it");
+                                match widget.hide() {
+                                    Ok(_) => println!("⏰ [REALTIME] ✅ Widget hidden successfully"),
+                                    Err(e) => println!("⏰ [REALTIME] ❌ Failed to hide widget: {}", e),
+                                }
+                            } else {
+                                println!("⏰ [REALTIME] ❌ Recording widget not found!");
+                            }
+
+                            // DON'T break - let the loop continue until frontend calls stop
+                            // which will set is_recording = false and trigger the break at line 478
+                        }
                     }
 
                     if listen_task.is_finished() {
@@ -488,6 +704,7 @@ pub fn run() {
         current_session_transcript: Arc::new(Mutex::new(String::new())),
         last_transcription: Arc::new(Mutex::new(None)),
         paste_in_progress: Arc::new(Mutex::new(false)),
+        recording_start_time: Arc::new(Mutex::new(None)),
     };
 
     // Debounce: prevent multiple triggers when keys are held down
@@ -521,6 +738,38 @@ pub fn run() {
                         if now.duration_since(*last) > Duration::from_millis(100) {
                             *last = now;
                             println!("🔥 Hotkey pressed: Ctrl+Space");
+
+                            // Show/hide widget based on recording state
+                            if let Some(state) = app.try_state::<AppState>() {
+                                let is_recording = *state.is_recording.lock().unwrap();
+
+                                if !is_recording {
+                                    // Starting recording - show widget
+                                    if let Some(widget) = app.get_webview_window("recording-widget") {
+                                        // Position widget at bottom-center of screen
+                                        if let Ok(monitor) = widget.current_monitor() {
+                                            if let Some(monitor) = monitor {
+                                                let screen_size = monitor.size();
+                                                let widget_width = 125;
+                                                let widget_height = 40;
+                                                let bottom_margin = 100; // 100px from bottom
+
+                                                let x = (screen_size.width as i32 - widget_width) / 2;
+                                                let y = screen_size.height as i32 - widget_height - bottom_margin;
+
+                                                let _ = widget.set_position(PhysicalPosition::new(x, y));
+                                            }
+                                        }
+                                        let _ = widget.show();
+                                        let _ = widget.set_focus();
+                                    }
+                                } else {
+                                    // Stopping recording - hide widget
+                                    if let Some(widget) = app.get_webview_window("recording-widget") {
+                                        let _ = widget.hide();
+                                    }
+                                }
+                            }
 
                             // Emit event to frontend
                             if let Some(window) = app.get_webview_window("main") {
@@ -593,6 +842,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_recording_audio,
             stop_recording_audio,
+            cancel_recording,
             get_last_transcription,
             get_transcription_history,
             copy_to_clipboard,

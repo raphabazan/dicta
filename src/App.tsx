@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { playStartSound, playStopSound, playCancelSound } from "./sounds";
 
 interface TranscriptionEntry {
   text: string;
@@ -28,6 +29,9 @@ function App() {
     try {
       setIsStarting(true);
       setCurrentTranscript(""); // Reset transcript
+
+      // Play start sound
+      playStartSound();
 
       // Query backend for current mode (source of truth)
       const useRealtime = await invoke<boolean>("get_use_realtime");
@@ -62,6 +66,9 @@ function App() {
     try {
       setIsStopping(true);
       setStatus("⏳ Processing...");
+
+      // Play stop sound
+      playStopSound();
 
       // Query backend for current mode (source of truth)
       const useRealtime = await invoke<boolean>("get_use_realtime");
@@ -161,6 +168,27 @@ function App() {
       }
     });
 
+    // Listen for widget stop event
+    const unlistenWidgetStop = listen("widget-stop-recording", async () => {
+      console.log("🛑 Widget stop event received");
+      await stopRecording();
+    });
+
+    // Listen for widget cancel event
+    const unlistenWidgetCancel = listen("recording-cancelled", async () => {
+      console.log("❌ Widget cancel event received");
+      playCancelSound();
+      setIsRecording(false);
+      setStatus("Cancelled");
+      setTimeout(() => setStatus("Ready"), 2000);
+    });
+
+    // Listen for auto-stop event (6 minute limit)
+    const unlistenAutoStop = listen("auto-stop-recording", async () => {
+      console.log("⏰ Auto-stop event received (6 minute limit)");
+      await stopRecording();
+    });
+
     // Listen for history updates
     const unlistenHistory = listen("history-updated", async () => {
       console.log("📚 History updated, reloading...");
@@ -213,6 +241,9 @@ function App() {
 
     return () => {
       unlistenHotkey.then((fn) => fn());
+      unlistenWidgetStop.then((fn) => fn());
+      unlistenWidgetCancel.then((fn) => fn());
+      unlistenAutoStop.then((fn) => fn());
       unlistenHistory.then((fn) => fn());
       unlistenDelta.then((fn) => fn());
       unlistenTranscription.then((fn) => fn());

@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Warning</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 280px;
+      height: 60px;
+      overflow: hidden;
+      background: transparent;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+
+    .warning {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      background: rgba(245, 158, 11, 0.95);
+      border: 1px solid rgba(245, 158, 11, 0.8);
+      border-radius: 12px;
+      padding: 0 16px;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+      backdrop-filter: blur(8px);
+    }
+
+    .message {
+      flex: 1;
+      color: white;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .close-btn {
+      width: 20px;
+      height: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border: none;
+      border-radius: 50%;
+      cursor: pointer;
+      background: rgba(255, 255, 255, 0.2);
+      transition: all 0.2s;
+      padding: 0;
+      flex-shrink: 0;
+    }
+
+    .close-btn:hover {
+      background: rgba(255, 255, 255, 0.3);
+      transform: scale(1.1);
+    }
+
+    .close-icon {
+      width: 10px;
+      height: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div class="warning">
+    <div class="message">
+      1 minute left for session end. To speak more, you can create a new session.
+    </div>
+    <button class="close-btn" id="closeBtn" title="Close">
+      <svg class="close-icon" viewBox="0 0 10 10" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M1 1L9 9M1 9L9 1" stroke="white" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+    </button>
+  </div>
+
+  <script type="module">
+    import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+
+    console.log('[WARNING] Script loaded at:', new Date().toISOString());
+    console.log('[WARNING] Window location:', window.location.href);
+
+    const closeBtn = document.getElementById('closeBtn');
+    const currentWindow = getCurrentWebviewWindow();
+
+    console.log('[WARNING] currentWindow obtained:', currentWindow);
+    console.log('[WARNING] currentWindow.label:', currentWindow.label);
+
+    closeBtn.addEventListener('click', async () => {
+      console.log('[WARNING] Close button clicked at:', new Date().toISOString());
+      try {
+        await currentWindow.hide();
+        console.log('[WARNING] ✅ Window hidden successfully via button');
+      } catch (err) {
+        console.error('[WARNING] ❌ Failed to hide via button:', err);
+      }
+    });
+
+    // Auto-hide after 2 seconds
+    console.log('[WARNING] Setting up auto-hide timer (2000ms) at:', new Date().toISOString());
+
+    // Visual countdown for debugging
+    const message = document.querySelector('.message');
+    let countdown = 2;
+    const countdownInterval = setInterval(() => {
+      countdown--;
+      console.log('[WARNING] Countdown:', countdown);
+      if (countdown <= 0) {
+        clearInterval(countdownInterval);
+      }
+    }, 1000);
+
+    const hideTimer = setTimeout(() => {
+      console.log('[WARNING] ⏰ Auto-hide timer triggered at:', new Date().toISOString());
+      clearInterval(countdownInterval);
+
+      currentWindow.hide()
+        .then(() => {
+          console.log('[WARNING] ✅ Window hidden successfully via timer at:', new Date().toISOString());
+        })
+        .catch(err => {
+          console.error('[WARNING] ❌ Failed to hide via timer:', err);
+          console.error('[WARNING] Error details:', JSON.stringify(err));
+        });
+    }, 2000);
+
+    console.log('[WARNING] Timer ID:', hideTimer);
+
+    // Log to confirm script executed completely
+    console.log('[WARNING] Script execution completed');
+  </script>
+</body>
+</html>
