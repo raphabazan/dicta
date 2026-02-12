@@ -6,8 +6,7 @@
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",
-    "frontendDist": "../dist",
-    "watchIgnore": ["dicta.db", "dicta.db-*"]
+    "frontendDist": "../dist"
   },
   "bundle": {
     "active": true,
@@ -26,7 +25,7 @@
         "height": 600,
         "resizable": true,
         "fullscreen": false,
-        "visible": true
+        "visible": false
       }
     ],
     "security": {
@@ -41,7 +40,11 @@
             "core:event:allow-unlisten",
             "core:event:allow-emit",
             "core:window:allow-show",
-            "core:window:allow-hide"
+            "core:window:allow-hide",
+            "core:tray:allow-new",
+            "core:tray:allow-set-icon",
+            "core:tray:allow-set-menu",
+            "core:tray:allow-set-tooltip"
           ],
           "commands": {
             "allow": ["start_recording_audio", "stop_recording_audio"]

@@ -94,7 +94,7 @@ function App() {
   const loadTranscriptionHistory = async () => {
     try {
       const history = await invoke<TranscriptionEntry[]>("get_transcription_history");
-      setTranscriptionHistory(history.reverse()); // Most recent first
+      setTranscriptionHistory(history); // Already ordered by backend (most recent first)
     } catch (error) {
       console.error("Failed to load history:", error);
     }

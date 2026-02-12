@@ -4,6 +4,8 @@ mod realtime;
 mod db;
 
 use tauri::{Emitter, Manager, State, AppHandle};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, GlobalShortcutExt};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use std::sync::{Arc, Mutex};
@@ -603,6 +605,52 @@ pub fn run() {
             get_selected_microphone
         ])
         .setup(|app| {
+            // Create tray menu
+            let show_item = MenuItem::with_id(app, "show", "Abrir Dicta", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Sair", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+            // Build system tray
+            let _tray = TrayIconBuilder::with_id("main-tray")
+                .tooltip("Dicta - Voice Transcription")
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&menu)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "quit" => {
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click { button: tauri::tray::MouseButton::Left, .. } = event {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
+            // Handle window close event - minimize to tray instead of closing
+            if let Some(window) = app.get_webview_window("main") {
+                let window_clone = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        // Prevent default close behavior
+                        api.prevent_close();
+                        // Hide window instead
+                        let _ = window_clone.hide();
+                    }
+                });
+            }
+
             // Register global hotkeys
             let shortcut_record = Shortcut::new(Some(Modifiers::CONTROL), Code::Space);
             app.global_shortcut().register(shortcut_record).unwrap();
