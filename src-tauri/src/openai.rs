@@ -1,0 +1,175 @@
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TranscriptionResponse {
+    pub text: String,
+}
+
+pub struct OpenAIClient {
+    api_key: String,
+    client: reqwest::Client,
+}
+
+impl OpenAIClient {
+    pub fn new(api_key: String) -> Self {
+        Self {
+            api_key,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    /// Transcribe audio using Whisper API (simpler than Realtime API for MVP)
+    pub async fn transcribe_audio(&self, audio_data: Vec<f32>, sample_rate: u32) -> Result<String, String> {
+        println!("🔄 Transcribing audio... ({} samples at {}Hz)", audio_data.len(), sample_rate);
+
+        // Convert f32 audio to WAV format
+        let wav_data = self.audio_to_wav(audio_data, sample_rate)?;
+
+        // Call Whisper API with Portuguese language hint
+        let form = reqwest::multipart::Form::new()
+            .text("model", "whisper-1")
+            .text("language", "pt")
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(wav_data)
+                    .file_name("audio.wav")
+                    .mime_str("audio/wav")
+                    .map_err(|e| format!("Failed to create multipart: {}", e))?,
+            );
+
+        let response = self
+            .client
+            .post("https://api.openai.com/v1/audio/transcriptions")
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send request: {}", e))?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(format!("API error: {}", error_text));
+        }
+
+        let result: TranscriptionResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        println!("✅ Transcription: {}", result.text);
+        Ok(result.text)
+    }
+
+    /// Post-process text with GPT-4o-mini
+    pub async fn post_process(&self, raw_text: &str) -> Result<String, String> {
+        println!("🤖 Post-processing with GPT-4o-mini...");
+
+        let prompt = format!(
+            "You are a text post-processor. Clean up this voice transcription:\n\
+            - Fix grammar and punctuation\n\
+            - Remove filler words (um, uh, like, you know)\n\
+            - DO NOT change the meaning\n\
+            - Output ONLY the cleaned text, nothing else\n\n\
+            Raw transcript: {}",
+            raw_text
+        );
+
+        let body = json!({
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant that cleans up voice transcriptions."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.3
+        });
+
+        let response = self
+            .client
+            .post("https://api.openai.com/v1/chat/completions")
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send request: {}", e))?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(format!("API error: {}", error_text));
+        }
+
+        let result: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        let processed_text = result["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        println!("✅ Processed text: {}", processed_text);
+        Ok(processed_text)
+    }
+
+    fn audio_to_wav(&self, audio_data: Vec<f32>, sample_rate: u32) -> Result<Vec<u8>, String> {
+        use std::io::Cursor;
+
+        println!("🎵 Converting audio: {} samples @ {}Hz", audio_data.len(), sample_rate);
+        println!("🎵 Duration: {:.2}s", audio_data.len() as f32 / sample_rate as f32);
+
+        // Keep original sample rate - Whisper handles various rates well
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = hound::WavWriter::new(&mut cursor, spec)
+                .map_err(|e| format!("Failed to create WAV writer: {}", e))?;
+
+            for sample in audio_data {
+                let amplitude = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                writer
+                    .write_sample(amplitude)
+                    .map_err(|e| format!("Failed to write sample: {}", e))?;
+            }
+
+            writer
+                .finalize()
+                .map_err(|e| format!("Failed to finalize WAV: {}", e))?;
+        }
+
+        let wav_data = cursor.into_inner();
+        println!("✅ WAV file size: {} bytes", wav_data.len());
+
+        Ok(wav_data)
+    }
+
+    fn resample_audio(&self, audio: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+        // Simple linear interpolation resampling
+        let ratio = from_rate as f64 / to_rate as f64;
+        let output_len = (audio.len() as f64 / ratio) as usize;
+        let mut output = Vec::with_capacity(output_len);
+
+        for i in 0..output_len {
+            let src_idx = i as f64 * ratio;
+            let idx = src_idx as usize;
+
+            if idx + 1 < audio.len() {
+                let frac = src_idx - idx as f64;
+                let sample = audio[idx] * (1.0 - frac as f32) + audio[idx + 1] * frac as f32;
+                output.push(sample);
+            } else if idx < audio.len() {
+                output.push(audio[idx]);
+            }
+        }
+
+        output
+    }
+}

@@ -1,0 +1,62 @@
+{
+  "productName": "Dicta",
+  "version": "0.1.0",
+  "identifier": "com.dicta.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist",
+    "watchIgnore": ["dicta.db", "dicta.db-*"]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": ""
+    }
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Dicta",
+        "width": 800,
+        "height": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "visible": true
+      }
+    ],
+    "security": {
+      "csp": null,
+      "capabilities": [
+        {
+          "identifier": "main-capability",
+          "description": "Capability for main window",
+          "windows": ["main"],
+          "permissions": [
+            "core:event:allow-listen",
+            "core:event:allow-unlisten",
+            "core:event:allow-emit",
+            "core:window:allow-show",
+            "core:window:allow-hide"
+          ],
+          "commands": {
+            "allow": ["start_recording_audio", "stop_recording_audio"]
+          }
+        }
+      ]
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    },
+    "globalShortcut": {
+      "shortcuts": []
+    },
+    "clipboardManager": {}
+  }
+}

@@ -1,0 +1,47 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Tauri
+src-tauri/target
+src-tauri/WixTools
+
+# Environment variables (IMPORTANT - contains API keys!)
+.env
+.env.local
+.env.*.local
+
+# Database files (contains user data and transcriptions)
+*.db
+*.db-shm
+*.db-wal
+
+# Audio debug files
+*.wav
+debug_audio.wav
+
+# Icon generation scripts (temporary)
+create-icon.ps1
+generate-icon.js
+generate-icon-proper.js
