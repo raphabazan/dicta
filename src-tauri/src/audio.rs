@@ -284,6 +284,7 @@ impl StreamingAudioRecorder {
 
     /// Start recording and return a channel to receive audio chunks
     pub fn start_streaming(&mut self, device_name: Option<String>) -> Result<mpsc::UnboundedReceiver<Vec<i16>>, String> {
+
         let device = get_input_device_by_name(device_name.as_deref())?;
 
         // Use device's native sample rate (usually 48kHz)

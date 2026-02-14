@@ -32,7 +32,7 @@
         "title": "Recording",
         "url": "widget.html",
         "width": 125,
-        "height": 40,
+        "height": 150,
         "resizable": false,
         "fullscreen": false,
         "visible": false,
@@ -40,7 +40,8 @@
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "transparent": true,
-        "dragDropEnabled": false
+        "dragDropEnabled": false,
+        "shadow": false
       },
       {
         "label": "warning-widget",
@@ -67,6 +68,8 @@
           "permissions": [
             "core:event:allow-listen",
             "core:event:allow-unlisten",
+            "core:window:allow-start-dragging",
+            "core:window:allow-outer-position",
             "core:event:allow-emit",
             "core:window:allow-show",
             "core:window:allow-hide",

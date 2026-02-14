@@ -13,15 +13,27 @@
 
     body {
       width: 125px;
-      height: 40px;
-      overflow: hidden;
+      height: 120px;
+      overflow: hidden; /* Remove scrollbars */
       background: transparent;
       font-family: system-ui, -apple-system, sans-serif;
     }
 
+    /* Force hide any scrollbars */
+    body::-webkit-scrollbar {
+      display: none;
+    }
+    body {
+      -ms-overflow-style: none;  /* IE and Edge */
+      scrollbar-width: none;  /* Firefox */
+    }
+
     .widget {
-      width: 100%;
-      height: 100%;
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      width: 125px;
+      height: 40px;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -101,16 +113,78 @@
       background: white;
       border-radius: 2px;
     }
+
+    /* Model selector combo box */
+    .model-selector {
+      position: absolute;
+      top: -110px;
+      left: 0;
+      width: 125px;
+      background: rgba(17, 24, 39, 0.95);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      border-radius: 8px;
+      padding: 4px;
+      opacity: 0;
+      visibility: hidden;
+      transition: opacity 0.2s, visibility 0.2s;
+      backdrop-filter: blur(8px);
+      box-shadow: 0 5px 20px rgba(0, 0, 0, 0.4);
+      z-index: 10;
+    }
+
+    .widget:hover .model-selector,
+    .widget.force-hover .model-selector {
+      opacity: 1;
+      visibility: visible;
+    }
+
+    .model-option {
+      width: 100%;
+      padding: 6px 8px;
+      background: transparent;
+      border: none;
+      color: white;
+      font-size: 11px;
+      text-align: left;
+      cursor: pointer;
+      border-radius: 4px;
+      transition: background 0.15s;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .model-option:hover {
+      background: rgba(239, 68, 68, 0.2);
+    }
+
+    .model-option.active {
+      background: rgba(239, 68, 68, 0.3);
+      font-weight: 500;
+    }
   </style>
 </head>
 <body>
   <div class="widget" id="widget">
+    <!-- Model selector (appears on hover) -->
+    <div class="model-selector" id="modelSelector">
+      <button class="model-option" data-model="transcribe-only" title="Transcribe Only">
+        Transcribe Only
+      </button>
+      <button class="model-option" data-model="gpt-4o-mini" title="GPT-4o Mini">
+        GPT-4o-mini
+      </button>
+      <button class="model-option" data-model="gpt-4.1" title="GPT-4.1">
+        GPT-4.1
+      </button>
+    </div>
+
     <button class="btn btn-cancel" id="cancelBtn" title="Cancel">
       <svg class="icon-cancel" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
         <path d="M1 1L11 11M1 11L11 1" stroke="white" stroke-width="1.5" stroke-linecap="round"/>
       </svg>
     </button>
-    <div class="drag-area" id="dragArea">
+    <div class="drag-area" id="dragArea" data-tauri-drag-region>
       <div class="indicator"></div>
     </div>
     <button class="btn btn-stop" id="stopBtn" title="Stop & Send">
@@ -120,7 +194,7 @@
 
   <script type="module">
     import { invoke } from '@tauri-apps/api/core';
-    import { emit } from '@tauri-apps/api/event';
+    import { emit, listen } from '@tauri-apps/api/event';
     import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 
     const cancelBtn = document.getElementById('cancelBtn');
@@ -128,39 +202,85 @@
     const dragArea = document.getElementById('dragArea');
     const widget = document.getElementById('widget');
     const currentWindow = getCurrentWebviewWindow();
+    const modelOptions = document.querySelectorAll('.model-option');
 
-    // Make widget draggable
-    let isDragging = false;
-    let startX = 0;
-    let startY = 0;
+    // Load and set active model from database
+    async function loadSelectedModel() {
+      try {
+        const model = await invoke('get_selected_prompt_model') || 'transcribe-only';
+        console.log('📋 Loading model from database:', model);
+        modelOptions.forEach(opt => {
+          opt.classList.toggle('active', opt.dataset.model === model);
+        });
+      } catch (error) {
+        console.error('Failed to load model:', error);
+      }
+    }
 
-    dragArea.addEventListener('mousedown', (e) => {
-      isDragging = true;
-      startX = e.screenX;
-      startY = e.screenY;
-      widget.style.cursor = 'grabbing';
-      e.preventDefault();
+    // Force hover display for 2 seconds when widget becomes visible
+    let forceHoverTimeout = null;
+
+    function showForceHover() {
+      loadSelectedModel();
+      widget.classList.add('force-hover');
+      console.log('🎯 Forcing hover display for 2 seconds');
+      if (forceHoverTimeout) clearTimeout(forceHoverTimeout);
+      forceHoverTimeout = setTimeout(() => {
+        widget.classList.remove('force-hover');
+        console.log('✅ Hover display timeout ended');
+      }, 2000);
+    }
+
+    // Trigger on window focus (when Tauri calls window.show())
+    window.addEventListener('focus', () => {
+      console.log('🪟 Widget window focused - showing hover');
+      showForceHover();
     });
 
-    document.addEventListener('mousemove', async (e) => {
-      if (!isDragging) return;
-
-      const deltaX = e.screenX - startX;
-      const deltaY = e.screenY - startY;
-
-      const pos = await currentWindow.outerPosition();
-      await currentWindow.setPosition({ x: pos.x + deltaX, y: pos.y + deltaY });
-
-      startX = e.screenX;
-      startY = e.screenY;
-    });
-
-    document.addEventListener('mouseup', () => {
-      if (isDragging) {
-        isDragging = false;
-        widget.style.cursor = 'move';
+    // Also trigger on visibilitychange
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        console.log('👁️ Widget became visible - showing hover');
+        showForceHover();
       }
     });
+
+    // Model selection
+    modelOptions.forEach(option => {
+      option.addEventListener('click', async (e) => {
+        e.stopPropagation(); // Prevent dragging
+        const model = option.dataset.model;
+        console.log('🔄 User clicked on model:', model);
+        try {
+          await invoke('set_selected_prompt_model', { model });
+          modelOptions.forEach(opt => opt.classList.remove('active'));
+          option.classList.add('active');
+          console.log('✅ Model saved to database:', model);
+
+          // Verify it was saved
+          const verification = await invoke('get_selected_prompt_model');
+          console.log('🔍 Verification - model in DB is now:', verification);
+        } catch (error) {
+          console.error('❌ Failed to save model:', error);
+        }
+      });
+    });
+
+    // Load selected model on start
+    loadSelectedModel();
+
+    // Listen for model-selected event from backend (sent when recording starts)
+    listen('model-selected', (event) => {
+      const model = event.payload;
+      console.log('📡 Backend sent model-selected event:', model);
+      modelOptions.forEach(opt => {
+        opt.classList.toggle('active', opt.dataset.model === model);
+      });
+      // Also show force-hover so user sees the selection
+      showForceHover();
+    });
+
+    // Dragging is now handled by data-tauri-drag-region attribute
 
     cancelBtn.addEventListener('click', async () => {
       try {

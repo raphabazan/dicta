@@ -175,10 +175,12 @@ impl RealtimeSession {
                                 println!("📥 Session event: {}", event_type);
                             }
                             "input_audio_buffer.speech_started" => {
-                                println!("🎤 Speech detected");
+                                println!("{} 🎤 Speech detected", crate::ts());
+                                on_event(TranscriptionEvent::SpeechStarted);
                             }
                             "input_audio_buffer.speech_stopped" => {
-                                println!("🤫 Speech stopped");
+                                println!("{} 🤫 Speech stopped", crate::ts());
+                                on_event(TranscriptionEvent::SpeechStopped);
                             }
                             "input_audio_buffer.committed" => {
                                 println!("✅ Audio buffer committed");
@@ -220,4 +222,6 @@ impl RealtimeSession {
 pub enum TranscriptionEvent {
     Delta(TranscriptionDelta),
     Completed(TranscriptionCompleted),
+    SpeechStarted,
+    SpeechStopped,
 }

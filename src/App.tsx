@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { playStartSound, playStopSound, playCancelSound } from "./sounds";
@@ -20,13 +20,19 @@ function App() {
   const [isStarting, setIsStarting] = useState(false); // Prevent duplicate start calls
   const [isStopping, setIsStopping] = useState(false); // Prevent duplicate stop calls
 
+  // Refs to always have current values inside event listener closures
+  const isRecordingRef = useRef(false);
+  const isStartingRef = useRef(false);
+  const isStoppingRef = useRef(false);
+
   const startRecording = async () => {
-    if (isStarting || isRecording) {
-      console.log("⏭️ Blocked: already starting or recording");
+    if (isStartingRef.current || isRecordingRef.current || isStoppingRef.current) {
+      console.log(`⏭️ Blocked: starting=${isStartingRef.current} recording=${isRecordingRef.current} stopping=${isStoppingRef.current}`);
       return;
     }
 
     try {
+      isStartingRef.current = true;
       setIsStarting(true);
       setCurrentTranscript(""); // Reset transcript
 
@@ -45,25 +51,29 @@ function App() {
         setStatus("🎤 Recording (Whisper)...");
       }
 
+      isRecordingRef.current = true;
       setIsRecording(true);
       console.log(`🔴 Recording started (${useRealtime ? 'Realtime' : 'Whisper'})`);
     } catch (error) {
       console.error("Failed to start recording:", error);
       setStatus("Error starting recording");
+      isRecordingRef.current = false;
     } finally {
+      isStartingRef.current = false;
       setTimeout(() => setIsStarting(false), 300);
     }
   };
 
   const stopRecording = async () => {
-    console.log(`🛑 stopRecording called (isStopping=${isStopping}, isRecording=${isRecording})`);
+    console.log(`🛑 stopRecording called (stopping=${isStoppingRef.current}, recording=${isRecordingRef.current})`);
 
-    if (isStopping || !isRecording) {
+    if (isStoppingRef.current || !isRecordingRef.current) {
       console.log("⏭️ Blocked: already stopping or not recording");
       return;
     }
 
     try {
+      isStoppingRef.current = true;
       setIsStopping(true);
       setStatus("⏳ Processing...");
 
@@ -84,6 +94,7 @@ function App() {
         console.log("✅ stop_recording_audio returned");
       }
 
+      isRecordingRef.current = false;
       setIsRecording(false);
       setStatus("Ready");
       console.log("⚪ Recording stopped");
@@ -92,8 +103,10 @@ function App() {
     } catch (error) {
       console.error("Failed to stop recording:", error);
       setStatus("Error stopping recording");
+      isRecordingRef.current = false;
       setIsRecording(false);
     } finally {
+      isStoppingRef.current = false;
       setIsStopping(false);
     }
   };
@@ -155,16 +168,18 @@ function App() {
   useEffect(() => {
     console.log("🎧 Setting up event listeners");
 
-    // Listen for hotkey events
+    // Listen for hotkey events - uses refs to avoid stale closure values
     const unlistenHotkey = listen("toggle-recording", async () => {
-      console.log(`✅ Hotkey event received (isRecording=${isRecording})`);
+      console.log(`✅ Hotkey event received (recording=${isRecordingRef.current}, stopping=${isStoppingRef.current}, starting=${isStartingRef.current})`);
 
-      if (isRecording) {
+      if (isRecordingRef.current) {
         console.log("➡️ Calling stopRecording()");
         await stopRecording();
-      } else {
+      } else if (!isStoppingRef.current) {
         console.log("➡️ Calling startRecording()");
         await startRecording();
+      } else {
+        console.log("⏭️ Hotkey ignored: stop in progress");
       }
     });
 
@@ -248,7 +263,7 @@ function App() {
       unlistenDelta.then((fn) => fn());
       unlistenTranscription.then((fn) => fn());
     };
-  }, [isRecording]);
+  }, []); // Empty deps - refs always have current values, no need to re-register
 
   const formatDate = (timestamp: number) => {
     const date = new Date(timestamp);

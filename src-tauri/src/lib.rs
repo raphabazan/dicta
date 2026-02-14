@@ -9,8 +9,24 @@ use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, GlobalShortcutExt};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use enigo::{Enigo, Key, Keyboard, Settings};
+
+fn ts() -> String {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = now.as_secs();
+    let millis = now.subsec_millis();
+    let hours = (secs % 86400) / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    format!("[{:02}:{:02}:{:02}.{:03}]", hours, minutes, seconds, millis)
+}
+
+macro_rules! tlog {
+    ($($arg:tt)*) => {
+        println!("{} {}", ts(), format!($($arg)*));
+    };
+}
 
 // Re-export TranscriptionEntry from db module
 use db::TranscriptionEntry;
@@ -18,23 +34,53 @@ use db::TranscriptionEntry;
 fn auto_paste_text(app: &AppHandle, text: &str) -> Result<(), String> {
     println!("🔄 Auto-pasting text...");
 
-    // 1. Read current clipboard
-    let original_clipboard = app.clipboard().read_text()
-        .map_err(|e| format!("Failed to read clipboard: {}", e))?;
-
-    println!("💾 Saved original clipboard: '{}'",
-        if original_clipboard.len() > 30 {
-            format!("{}...", &original_clipboard[..30])
-        } else {
-            original_clipboard.clone()
+    // 1. Read current clipboard (with retry)
+    let original_clipboard = {
+        let mut attempts = 0;
+        loop {
+            match app.clipboard().read_text() {
+                Ok(content) => break content,
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= 3 {
+                        println!("⚠️ Failed to read clipboard after 3 attempts, using empty string");
+                        break String::new();
+                    }
+                    println!("⚠️ Clipboard read attempt {} failed: {}, retrying...", attempts, e);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
         }
-    );
+    };
 
-    // 2. Write transcribed text to clipboard
-    app.clipboard().write_text(text)
-        .map_err(|e| format!("Failed to write to clipboard: {}", e))?;
+    // Safely truncate clipboard preview (handle UTF-8 char boundaries)
+    let clipboard_preview = if original_clipboard.len() > 30 {
+        original_clipboard.chars().take(30).collect::<String>() + "..."
+    } else {
+        original_clipboard.clone()
+    };
+    println!("💾 Saved original clipboard: '{}'", clipboard_preview);
 
-    println!("📋 Transcription in clipboard");
+    // 2. Write transcribed text to clipboard (with retry)
+    {
+        let mut attempts = 0;
+        loop {
+            match app.clipboard().write_text(text) {
+                Ok(_) => {
+                    println!("📋 Transcription written to clipboard");
+                    break;
+                }
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= 3 {
+                        return Err(format!("Failed to write to clipboard after 3 attempts: {}", e));
+                    }
+                    println!("⚠️ Clipboard write attempt {} failed: {}, retrying...", attempts, e);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    }
 
     // 3. Wait for:
     // - Clipboard to update
@@ -87,10 +133,14 @@ struct AppState {
     database: Arc<db::Database>,
     is_recording: Arc<Mutex<bool>>,
     use_realtime: Arc<Mutex<bool>>, // Track which API to use
+    prompt_mode: Arc<Mutex<Option<String>>>, // Track prompt mode: None, Some("gpt-4o-mini"), or Some("gpt-4o")
     current_session_transcript: Arc<Mutex<String>>, // Accumulate transcript for current session
     last_transcription: Arc<Mutex<Option<String>>>,
     paste_in_progress: Arc<Mutex<bool>>,
     recording_start_time: Arc<Mutex<Option<Instant>>>,
+    speech_active: Arc<Mutex<bool>>, // Track if speech is currently being detected
+    last_speech_end: Arc<Mutex<Option<Instant>>>, // Track when last speech ended
+    last_transcription_time: Arc<Mutex<Option<Instant>>>, // Track when last transcription.completed arrived
 }
 
 #[tauri::command]
@@ -250,6 +300,9 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
         return Err("No audio recorded".to_string());
     }
 
+    // Check if we're in prompt mode
+    let prompt_mode = state.prompt_mode.lock().unwrap().clone();
+
     // Transcribe (without post-processing for speed)
     let openai = state.openai_client.clone();
     let last_transcription = state.last_transcription.clone();
@@ -260,32 +313,75 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
             Ok(transcribed_text) => {
                 println!("✨ Transcribed: {}", transcribed_text);
 
-                // Save last transcription
-                *last_transcription.lock().unwrap() = Some(transcribed_text.clone());
+                // Check if we're in prompt mode
+                if let Some(model) = prompt_mode {
+                    println!("🤖 Prompt mode active with model: {}", model);
 
-                // Save to database
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64;
+                    // Send transcribed text as prompt to GPT
+                    match openai.send_prompt(&transcribed_text, &model).await {
+                        Ok(gpt_response) => {
+                            println!("✨ GPT Response: {}", gpt_response);
 
-                if let Err(e) = database.save_transcription(&transcribed_text, timestamp) {
-                    eprintln!("❌ Failed to save to database: {}", e);
-                }
+                            // Save GPT response as last transcription
+                            *last_transcription.lock().unwrap() = Some(gpt_response.clone());
 
-                // Notify frontend that history was updated
-                if let Some(window) = app_handle.get_webview_window("main") {
-                    let _ = window.emit("history-updated", ());
-                }
+                            // Save to database (save the GPT response, not the prompt)
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as i64;
 
-                // Auto-paste: save clipboard, paste, restore
-                match auto_paste_text(&app_handle, &transcribed_text) {
-                    Ok(_) => println!("✅ Text auto-pasted successfully"),
-                    Err(e) => {
-                        eprintln!("⚠️ Auto-paste failed: {}", e);
-                        // Notify frontend of failure
-                        if let Some(window) = app_handle.get_webview_window("main") {
-                            let _ = window.emit("paste-failed", ());
+                            if let Err(e) = database.save_transcription(&gpt_response, timestamp) {
+                                eprintln!("❌ Failed to save to database: {}", e);
+                            }
+
+                            // Notify frontend
+                            if let Some(window) = app_handle.get_webview_window("main") {
+                                let _ = window.emit("history-updated", ());
+                            }
+
+                            // Auto-paste GPT response
+                            match auto_paste_text(&app_handle, &gpt_response) {
+                                Ok(_) => println!("✅ GPT response auto-pasted successfully"),
+                                Err(e) => {
+                                    eprintln!("⚠️ Auto-paste failed: {}", e);
+                                    if let Some(window) = app_handle.get_webview_window("main") {
+                                        let _ = window.emit("paste-failed", ());
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("❌ GPT prompt error: {}", e),
+                    }
+                } else {
+                    // Normal transcription mode
+                    // Save last transcription
+                    *last_transcription.lock().unwrap() = Some(transcribed_text.clone());
+
+                    // Save to database
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64;
+
+                    if let Err(e) = database.save_transcription(&transcribed_text, timestamp) {
+                        eprintln!("❌ Failed to save to database: {}", e);
+                    }
+
+                    // Notify frontend that history was updated
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.emit("history-updated", ());
+                    }
+
+                    // Auto-paste: save clipboard, paste, restore
+                    match auto_paste_text(&app_handle, &transcribed_text) {
+                        Ok(_) => println!("✅ Text auto-pasted successfully"),
+                        Err(e) => {
+                            eprintln!("⚠️ Auto-paste failed: {}", e);
+                            // Notify frontend of failure
+                            if let Some(window) = app_handle.get_webview_window("main") {
+                                let _ = window.emit("paste-failed", ());
+                            }
                         }
                     }
                 }
@@ -359,6 +455,51 @@ fn get_selected_microphone(state: State<'_, AppState>) -> Result<Option<String>,
 }
 
 #[tauri::command]
+fn set_selected_prompt_model(state: State<'_, AppState>, model: String) -> Result<(), String> {
+    // Save as current session model
+    state.database.save_setting("selected_prompt_model", &model)
+        .map_err(|e| format!("Failed to save prompt model setting: {}", e))?;
+
+    // If user chose a GPT model (not transcribe-only), also remember it as their preferred prompt model
+    // so Ctrl+Shift+Space uses it next time
+    if model != "transcribe-only" {
+        state.database.save_setting("user_prompt_model", &model)
+            .map_err(|e| format!("Failed to save user prompt model: {}", e))?;
+        println!("💾 Selected prompt model: {} (also saved as user_prompt_model)", model);
+    } else {
+        println!("💾 Selected prompt model: transcribe-only (user_prompt_model unchanged)");
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_selected_prompt_model(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    state.database.load_setting("selected_prompt_model")
+        .map_err(|e| format!("Failed to load prompt model setting: {}", e))
+}
+
+#[tauri::command]
+fn get_current_recording_mode(state: State<'_, AppState>) -> Result<String, String> {
+    // Return the model that should be pre-selected based on current prompt_mode
+    let prompt_mode = state.prompt_mode.lock().unwrap().clone();
+
+    let model = match prompt_mode.as_deref() {
+        Some("gpt-4o-mini") => "gpt-4o-mini".to_string(),
+        Some("gpt-4.1") => "gpt-4.1".to_string(),
+        None => "transcribe-only".to_string(),
+        Some(other) => {
+            println!("⚠️ Unknown prompt mode: {}, defaulting to transcribe-only", other);
+            "transcribe-only".to_string()
+        }
+    };
+
+    println!("📋 get_current_recording_mode: prompt_mode={:?}, returning model={}", prompt_mode, model);
+    Ok(model)
+}
+
+// Removed start_pre_buffering - pre-buffering logic moved to audio capture
+
+#[tauri::command]
 async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> Result<String, String> {
     let mut is_recording = state.is_recording.lock().unwrap();
     if *is_recording {
@@ -373,8 +514,11 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
 
     drop(is_recording);
 
-    // Reset current session transcript
+    // Reset current session transcript and speech state
     *state.current_session_transcript.lock().unwrap() = String::new();
+    *state.speech_active.lock().unwrap() = false;
+    *state.last_speech_end.lock().unwrap() = None;
+    *state.last_transcription_time.lock().unwrap() = None;
 
     // Get selected microphone from settings
     let selected_mic = state.database.load_setting("selected_microphone")
@@ -387,6 +531,12 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
     let current_session_transcript = state.current_session_transcript.clone();
     let is_recording_flag = state.is_recording.clone();
     let recording_start = state.recording_start_time.clone();
+    let speech_active_for_listener = state.speech_active.clone();
+    let last_speech_end_for_listener = state.last_speech_end.clone();
+    let speech_active_for_stop = state.speech_active.clone();
+    let last_speech_end_for_stop = state.last_speech_end.clone();
+    let last_transcription_time_for_listener = state.last_transcription_time.clone();
+    let last_transcription_time_for_stop = state.last_transcription_time.clone();
     let app_handle = app.clone();
 
     tokio::spawn(async move {
@@ -444,6 +594,7 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
                 // Clone session for sending audio
                 let session_clone = Arc::new(session);
                 let session_for_audio = session_clone.clone();
+                let session_for_commit = session_clone.clone();
 
                 // Spawn task to send audio chunks to WebSocket
                 let audio_task = tokio::spawn(async move {
@@ -479,6 +630,16 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
                             realtime::TranscriptionEvent::Completed(_completed) => {
                                 // Don't auto-paste on each VAD completion - wait for user to stop
                                 println!("✨ Turn completed (VAD detected pause)");
+                                *last_transcription_time_for_listener.lock().unwrap() = Some(Instant::now());
+                            }
+                            realtime::TranscriptionEvent::SpeechStarted => {
+                                *speech_active_for_listener.lock().unwrap() = true;
+                                println!("🗣️ Speech tracking: ACTIVE");
+                            }
+                            realtime::TranscriptionEvent::SpeechStopped => {
+                                *speech_active_for_listener.lock().unwrap() = false;
+                                *last_speech_end_for_listener.lock().unwrap() = Some(Instant::now());
+                                println!("🔇 Speech tracking: STOPPED");
                             }
                         })
                         .await;
@@ -591,10 +752,57 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
                     }
                 }
 
-                // Stop sending new audio (audio thread will detect is_recording=false and stop)
-                // But keep listening for transcription events for a bit longer
-                println!("⏳ Waiting 2 seconds for final transcription events...");
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                // Mic stopped. Now:
+                // 1. Force-commit the audio buffer so API processes whatever was in-flight
+                // 2. Wait for transcription.completed to arrive (not speech_stopped which may not come)
+                // 3. Timeout quickly if nothing was in-flight
+                println!("🎙️ Mic stopped, committing buffer and waiting for final transcription...");
+
+                let stop_time = Instant::now();
+
+                // Remember if speech was active at stop time
+                let speech_was_active = *speech_active_for_stop.lock().unwrap();
+                let had_any_speech = last_speech_end_for_stop.lock().unwrap().is_some() || speech_was_active;
+                let transcription_before_stop = last_transcription_time_for_stop.lock().unwrap().clone();
+
+                if had_any_speech {
+                    // Explicitly commit the buffer - forces API to transcribe whatever audio is buffered
+                    println!("{} 🔔 Committing audio buffer to force transcription of in-flight audio...", ts());
+                    if let Err(e) = session_for_commit.commit_audio().await {
+                        println!("⚠️ commit_audio failed (may be ok if VAD already committed): {}", e);
+                    }
+
+                    // Wait for a NEW transcription.completed to arrive after our stop time
+                    // This is faster than waiting for speech_stopped
+                    let max_wait = Duration::from_millis(3500);
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+
+                        let latest_transcription = last_transcription_time_for_stop.lock().unwrap().clone();
+                        let elapsed = stop_time.elapsed();
+
+                        // Check if a new transcription arrived after we stopped
+                        let new_transcription_arrived = match (latest_transcription, transcription_before_stop) {
+                            (Some(latest), Some(before)) => latest > before,
+                            (Some(_), None) => true,
+                            _ => false,
+                        };
+
+                        if new_transcription_arrived {
+                            println!("{} ✅ Final transcription arrived ({:.0}ms after stop)", ts(), elapsed.as_millis());
+                            // Small buffer to ensure the text is accumulated
+                            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                            break;
+                        }
+
+                        if elapsed > max_wait {
+                            println!("{} ⏱️ No new transcription after {:.0}ms - was speech fully sent before stop?", ts(), elapsed.as_millis());
+                            break;
+                        }
+                    }
+                } else {
+                    println!("📭 No speech detected during recording, stopping immediately");
+                }
 
                 // Now abort the tasks
                 println!("🛑 Aborting audio and listen tasks...");
@@ -630,43 +838,153 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
         println!("✅ is_recording is now false");
     } // Drop lock before await
 
-    // Wait for the recording task to clean up (it waits 2 seconds for final events)
-    println!("⏳ Waiting 3 seconds for recording task to finish cleanup...");
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    // Wait for the internal spawn task to finish cleanup.
+    // The spawn signals completion by setting is_recording_flag=false (different from AppState.is_recording).
+    // We wait up to 5s for the spawn to finish its commit+transcription wait.
+    println!("⏳ Waiting for final transcription after stop...");
+    {
+        let wait_start = Instant::now();
+        let transcription_at_stop = state.last_transcription_time.lock().unwrap().clone();
+        let had_speech = state.last_speech_end.lock().unwrap().is_some()
+            || *state.speech_active.lock().unwrap();
+        let max_wait = Duration::from_millis(4500);
+
+        if had_speech {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                let latest = state.last_transcription_time.lock().unwrap().clone();
+                let new_arrived = match (latest, transcription_at_stop) {
+                    (Some(l), Some(b)) => l > b,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+
+                if new_arrived {
+                    println!("{} ✅ Transcription received, reading transcript now", ts());
+                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                    break;
+                }
+
+                if wait_start.elapsed() > max_wait {
+                    println!("{} ⏱️ Timeout waiting for transcription ({:.0}ms)", ts(), wait_start.elapsed().as_millis());
+                    break;
+                }
+            }
+        } else {
+            println!("📭 No speech, proceeding immediately");
+        }
+    }
 
     // Get accumulated transcript
     println!("📝 Getting accumulated transcript...");
     let transcript = state.current_session_transcript.lock().unwrap().clone();
     println!("📝 Transcript length: {} characters", transcript.len());
 
+    // Check selected model in database FIRST (allows changing model during any recording)
+    let (should_use_prompt, selected_model) = {
+        let mut pm = state.prompt_mode.lock().unwrap();
+        let mode = pm.clone();
+        println!("🔍 DEBUG: prompt_mode at start of stop_realtime_recording = {:?}", mode);
+
+        // Always check the current selected model in database
+        let current_model = state.database.load_setting("selected_prompt_model")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                println!("⚠️ No model found in settings, defaulting to transcribe-only");
+                "transcribe-only".to_string()
+            });
+        println!("🔍 DEBUG: Current selected model in database = '{}'", current_model);
+
+        *pm = None; // Clear for next recording
+
+        // If model is "transcribe-only", treat as normal transcription (no prompt)
+        if current_model == "transcribe-only" {
+            println!("📝 Model is 'transcribe-only' - will NOT send to GPT");
+            (false, String::new())
+        } else {
+            println!("🤖 Model is '{}' - WILL send to GPT (regardless of how recording started)", current_model);
+            (true, current_model)
+        }
+    };
+
+    println!("🎯 Final decision: should_use_prompt = {}, selected_model = '{}'", should_use_prompt, selected_model);
+
     if !transcript.is_empty() {
-        // Save to database (single entry for entire session)
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        // Check if we need to send to GPT first
+        if should_use_prompt {
+            println!("🤖 [REALTIME] Prompt mode active with model: {}", selected_model);
 
-        if let Err(e) = state.database.save_transcription(&transcript, timestamp) {
-            eprintln!("❌ Failed to save to database: {}", e);
-        }
+            // Send transcript as prompt to GPT
+            let openai = state.openai_client.clone();
+            let database = state.database.clone();
+            let last_transcription = state.last_transcription.clone();
+            let app_clone = app.clone();
+            let transcript_clone = transcript.clone();
 
-        // Update last transcription
-        *state.last_transcription.lock().unwrap() = Some(transcript.clone());
+            tokio::spawn(async move {
+                match openai.send_prompt(&transcript_clone, &selected_model).await {
+                    Ok(gpt_response) => {
+                        println!("✨ GPT Response: {}", gpt_response);
 
-        // Notify frontend
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.emit("history-updated", ());
-        }
+                        // Save GPT response to database (not the transcript)
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as i64;
 
-        // Auto-paste the full session transcript
-        let app_clone = app.clone();
-        let text_clone = transcript.clone();
-        std::thread::spawn(move || {
-            match auto_paste_text(&app_clone, &text_clone) {
-                Ok(_) => println!("✅ Session transcript auto-pasted"),
-                Err(e) => eprintln!("⚠️ Auto-paste failed: {}", e),
+                        if let Err(e) = database.save_transcription(&gpt_response, timestamp) {
+                            eprintln!("❌ Failed to save to database: {}", e);
+                        }
+
+                        // Update last transcription with GPT response
+                        *last_transcription.lock().unwrap() = Some(gpt_response.clone());
+
+                        // Notify frontend
+                        if let Some(window) = app_clone.get_webview_window("main") {
+                            let _ = window.emit("history-updated", ());
+                        }
+
+                        // Auto-paste GPT response
+                        match auto_paste_text(&app_clone, &gpt_response) {
+                            Ok(_) => println!("✅ GPT response auto-pasted"),
+                            Err(e) => eprintln!("⚠️ Auto-paste failed: {}", e),
+                        }
+                    }
+                    Err(e) => eprintln!("❌ GPT prompt error: {}", e),
+                }
+            });
+        } else {
+            // Normal mode: just paste the transcript
+            // Save to database (single entry for entire session)
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+
+            if let Err(e) = state.database.save_transcription(&transcript, timestamp) {
+                eprintln!("❌ Failed to save to database: {}", e);
             }
-        });
+
+            // Update last transcription
+            *state.last_transcription.lock().unwrap() = Some(transcript.clone());
+
+            // Notify frontend
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("history-updated", ());
+            }
+
+            // Auto-paste the full session transcript
+            let app_clone = app.clone();
+            let text_clone = transcript.clone();
+            std::thread::spawn(move || {
+                match auto_paste_text(&app_clone, &text_clone) {
+                    Ok(_) => println!("✅ Session transcript auto-pasted"),
+                    Err(e) => eprintln!("⚠️ Auto-paste failed: {}", e),
+                }
+            });
+        }
     }
 
     Ok("Realtime recording stopped".to_string())
@@ -701,10 +1019,14 @@ pub fn run() {
         database,
         is_recording: Arc::new(Mutex::new(false)),
         use_realtime: Arc::new(Mutex::new(true)), // Default to Realtime API
+        prompt_mode: Arc::new(Mutex::new(None)),
         current_session_transcript: Arc::new(Mutex::new(String::new())),
         last_transcription: Arc::new(Mutex::new(None)),
         paste_in_progress: Arc::new(Mutex::new(false)),
         recording_start_time: Arc::new(Mutex::new(None)),
+        speech_active: Arc::new(Mutex::new(false)),
+        last_speech_end: Arc::new(Mutex::new(None)),
+        last_transcription_time: Arc::new(Mutex::new(None)),
     };
 
     // Debounce: prevent multiple triggers when keys are held down
@@ -729,7 +1051,125 @@ pub fn run() {
                     // Check which shortcut was pressed
                     let shortcut_str = format!("{:?}", shortcut);
 
-                    if shortcut_str.contains("Space") {
+                    if shortcut_str.contains("Space") && shortcut_str.contains("CONTROL") && shortcut_str.contains("SHIFT") {
+                        // Ctrl+Shift+Space: Toggle recording with selected prompt model
+                        let mut last = last_recording_trigger_clone.lock().unwrap();
+                        let now = Instant::now();
+
+                        if now.duration_since(*last) > Duration::from_millis(100) {
+                            *last = now;
+                            println!("🔥 Hotkey pressed: Ctrl+Shift+Space (Prompt mode)");
+
+                            if let Some(state) = app.try_state::<AppState>() {
+                                let is_recording = *state.is_recording.lock().unwrap();
+
+                                if !is_recording {
+                                    // Ctrl+Shift+Space: use the user's chosen prompt model (separate key)
+                                    // This is the model the user picked in the combo box for prompt sessions
+                                    let model = state.database.load_setting("user_prompt_model")
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or_else(|| "gpt-4o-mini".to_string());
+
+                                    // Save as current session model
+                                    let _ = state.database.save_setting("selected_prompt_model", &model);
+
+                                    *state.prompt_mode.lock().unwrap() = Some(model.clone());
+                                    println!("🤖 Prompt mode enabled: {} (saved to DB)", model);
+
+                                    // Show widget
+                                    if let Some(widget) = app.get_webview_window("recording-widget") {
+                                        if let Ok(monitor) = widget.current_monitor() {
+                                            if let Some(monitor) = monitor {
+                                                let screen_size = monitor.size();
+                                                let widget_width = 125;
+                                                let widget_height = 120; // Height increased for combo box
+                                                let bottom_margin = 200; // More space from taskbar
+
+                                                let x = (screen_size.width as i32 - widget_width) / 2;
+                                                let y = screen_size.height as i32 - widget_height - bottom_margin;
+
+                                                let _ = widget.set_position(PhysicalPosition::new(x, y));
+                                            }
+                                        }
+                                        let _ = widget.show();
+                                        // Tell widget which model is active
+                                        let _ = widget.emit("model-selected", model.clone());
+                                    }
+                                } else {
+                                    // Stopping recording - DON'T clear prompt_mode here
+                                    // It will be cleared in stop_realtime_recording after being used
+                                    println!("🛑 [Ctrl+Shift+Space] Stopping - prompt_mode will be used in stop handler");
+
+                                    if let Some(widget) = app.get_webview_window("recording-widget") {
+                                        let _ = widget.hide();
+                                    }
+                                }
+                            }
+
+                            // Emit event to frontend
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.emit("toggle-recording", ());
+                            }
+                        } else {
+                            println!("⏭️ Ctrl+Shift+Space ignored (debounce)");
+                        }
+                    } else if shortcut_str.contains("Space") && shortcut_str.contains("CONTROL") && shortcut_str.contains("ALT") {
+                        // Ctrl+Alt+Space: Toggle recording with GPT-4o prompt mode
+                        let mut last = last_recording_trigger_clone.lock().unwrap();
+                        let now = Instant::now();
+
+                        if now.duration_since(*last) > Duration::from_millis(100) {
+                            *last = now;
+                            println!("🔥 Hotkey pressed: Ctrl+Alt+Space (GPT-4o mode)");
+
+                            if let Some(state) = app.try_state::<AppState>() {
+                                let is_recording = *state.is_recording.lock().unwrap();
+
+                                if !is_recording {
+                                    // Set prompt mode to gpt-4.1 and save to database
+                                    let _ = state.database.save_setting("selected_prompt_model", "gpt-4.1");
+                                    *state.prompt_mode.lock().unwrap() = Some("gpt-4.1".to_string());
+                                    println!("🤖 Prompt mode enabled: gpt-4.1 (saved to DB)");
+
+                                    // Show widget
+                                    if let Some(widget) = app.get_webview_window("recording-widget") {
+                                        if let Ok(monitor) = widget.current_monitor() {
+                                            if let Some(monitor) = monitor {
+                                                let screen_size = monitor.size();
+                                                let widget_width = 125;
+                                                let widget_height = 120; // Height increased for combo box
+                                                let bottom_margin = 200; // More space from taskbar
+
+                                                let x = (screen_size.width as i32 - widget_width) / 2;
+                                                let y = screen_size.height as i32 - widget_height - bottom_margin;
+
+                                                let _ = widget.set_position(PhysicalPosition::new(x, y));
+                                            }
+                                        }
+                                        let _ = widget.show();
+                                        // Tell widget which model is active
+                                        let _ = widget.emit("model-selected", "gpt-4.1".to_string());
+                                    }
+                                } else {
+                                    // Stopping recording - DON'T clear prompt_mode here
+                                    // It will be cleared in stop_realtime_recording after being used
+                                    println!("🛑 [Ctrl+Alt+Space] Stopping - prompt_mode (gpt-4.1) will be used in stop handler");
+
+                                    if let Some(widget) = app.get_webview_window("recording-widget") {
+                                        let _ = widget.hide();
+                                    }
+                                }
+                            }
+
+                            // Emit event to frontend
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.emit("toggle-recording", ());
+                            }
+                        } else {
+                            println!("⏭️ Ctrl+Alt+Space ignored (debounce)");
+                        }
+                    } else if shortcut_str.contains("Space") {
                         // Ctrl+Space: Toggle recording (with minimal debounce for safety)
                         let mut last = last_recording_trigger_clone.lock().unwrap();
                         let now = Instant::now();
@@ -744,6 +1184,20 @@ pub fn run() {
                                 let is_recording = *state.is_recording.lock().unwrap();
 
                                 if !is_recording {
+                                    // Check if prompt mode was already set by Ctrl+Shift+Space or Ctrl+Alt+Space
+                                    let current_prompt_mode = state.prompt_mode.lock().unwrap().clone();
+
+                                    // Determine which model to show in widget
+                                    let widget_model = if current_prompt_mode.is_none() {
+                                        println!("📝 Ctrl+Space starting - setting prompt mode to None (normal transcription)");
+                                        let _ = state.database.save_setting("selected_prompt_model", "transcribe-only");
+                                        *state.prompt_mode.lock().unwrap() = None;
+                                        "transcribe-only".to_string()
+                                    } else {
+                                        println!("⚠️ Ctrl+Space starting but prompt_mode already set to {:?} - keeping it", current_prompt_mode);
+                                        current_prompt_mode.clone().unwrap_or_else(|| "transcribe-only".to_string())
+                                    };
+
                                     // Starting recording - show widget
                                     if let Some(widget) = app.get_webview_window("recording-widget") {
                                         // Position widget at bottom-center of screen
@@ -751,8 +1205,8 @@ pub fn run() {
                                             if let Some(monitor) = monitor {
                                                 let screen_size = monitor.size();
                                                 let widget_width = 125;
-                                                let widget_height = 40;
-                                                let bottom_margin = 100; // 100px from bottom
+                                                let widget_height = 120; // Height increased for combo box
+                                                let bottom_margin = 200; // More space from taskbar
 
                                                 let x = (screen_size.width as i32 - widget_width) / 2;
                                                 let y = screen_size.height as i32 - widget_height - bottom_margin;
@@ -761,10 +1215,16 @@ pub fn run() {
                                             }
                                         }
                                         let _ = widget.show();
-                                        let _ = widget.set_focus();
+                                        // Tell widget which model is active
+                                        let _ = widget.emit("model-selected", widget_model);
                                     }
                                 } else {
-                                    // Stopping recording - hide widget
+                                    // Stopping recording with Ctrl+Space
+                                    let current_prompt_mode = state.prompt_mode.lock().unwrap().clone();
+                                    println!("🛑 [Ctrl+Space] Stopping recording - prompt_mode = {:?}", current_prompt_mode);
+                                    println!("📌 Prompt mode will be preserved for stop_realtime_recording");
+
+                                    // Hide widget
                                     if let Some(widget) = app.get_webview_window("recording-widget") {
                                         let _ = widget.hide();
                                     }
@@ -820,6 +1280,9 @@ pub fn run() {
 
                                     // auto_paste_text handles: save clipboard, copy text, paste (Ctrl+V), restore clipboard
                                     std::thread::spawn(move || {
+                                        // Small delay to ensure clipboard is ready
+                                        std::thread::sleep(std::time::Duration::from_millis(100));
+
                                         if let Err(e) = auto_paste_text(&app_handle, &text_clone) {
                                             eprintln!("❌ Failed to paste: {}", e);
                                         }
@@ -852,7 +1315,10 @@ pub fn run() {
             get_use_realtime,
             list_microphones,
             set_selected_microphone,
-            get_selected_microphone
+            get_selected_microphone,
+            set_selected_prompt_model,
+            get_selected_prompt_model,
+            get_current_recording_mode
         ])
         .setup(|app| {
             // Create tray menu
@@ -905,6 +1371,12 @@ pub fn run() {
             let shortcut_record = Shortcut::new(Some(Modifiers::CONTROL), Code::Space);
             app.global_shortcut().register(shortcut_record).unwrap();
 
+            let shortcut_prompt_mini = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
+            app.global_shortcut().register(shortcut_prompt_mini).unwrap();
+
+            let shortcut_prompt_full = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Space);
+            app.global_shortcut().register(shortcut_prompt_full).unwrap();
+
             let shortcut_paste = Shortcut::new(
                 Some(Modifiers::ALT | Modifiers::SHIFT),
                 Code::KeyZ
@@ -913,6 +1385,8 @@ pub fn run() {
 
             println!("✅ Dicta is running!");
             println!("📌 Press Ctrl+Space to start/stop recording");
+            println!("📌 Press Ctrl+Shift+Space for GPT-4o-mini prompt mode");
+            println!("📌 Press Ctrl+Alt+Space for GPT-4.1 prompt mode");
             println!("📌 Press Alt+Shift+Z to paste last transcription");
             println!("🔑 OpenAI API key loaded");
 

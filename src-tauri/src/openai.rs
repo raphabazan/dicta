@@ -156,6 +156,94 @@ impl OpenAIClient {
         Ok(processed_text)
     }
 
+    /// Send prompt to GPT model and get response with web search enabled
+    pub async fn send_prompt(&self, prompt: &str, model: &str) -> Result<String, String> {
+        println!("🤖 Sending prompt to {} with web search...", model);
+        println!("📝 Prompt: {}", prompt);
+
+        // Map model names to their correct identifiers
+        let api_model = match model {
+            "gpt-4o-mini" => "gpt-4o-mini",
+            "gpt-4o" => "gpt-4.1",
+            "gpt-4.1" => "gpt-4.1",
+            _ => model
+        };
+
+        let body = json!({
+            "model": api_model,
+            "tools": [
+                {"type": "web_search"}
+            ],
+            "tool_choice": "auto",
+            "input": prompt
+        });
+
+        let response = self
+            .client
+            .post("https://api.openai.com/v1/responses")
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to send request: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(format!("API error ({}): {}", status, error_text));
+        }
+
+        let result: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        // Log if web search was used
+        if let Some(outputs) = result["output"].as_array() {
+            for output in outputs {
+                if output["type"] == "web_search_call" {
+                    println!("🌐 Web search was used for this query");
+                    if let Some(action) = output.get("action") {
+                        println!("🔍 Search action: {:?}", action);
+                    }
+                }
+            }
+        }
+
+        // Extract output_text from Responses API response
+        let response_text = result["output_text"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+
+        if response_text.is_empty() {
+            // Fallback: try to extract from output array
+            if let Some(outputs) = result["output"].as_array() {
+                for output in outputs {
+                    if output["type"] == "message" {
+                        if let Some(content) = output["content"].as_array() {
+                            for item in content {
+                                if item["type"] == "output_text" {
+                                    let text = item["text"].as_str().unwrap_or("").trim();
+                                    if !text.is_empty() {
+                                        println!("✅ Response from {} (web search): {}", model, text);
+                                        return Ok(text.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Err("No response text found in API response".to_string());
+        }
+
+        println!("✅ Response from {} (web search): {}", model, response_text);
+        Ok(response_text)
+    }
+
     fn audio_to_wav(&self, audio_data: Vec<f32>, sample_rate: u32) -> Result<Vec<u8>, String> {
         use std::io::Cursor;
 
