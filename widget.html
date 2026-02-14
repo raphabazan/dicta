@@ -252,7 +252,7 @@
         const model = option.dataset.model;
         console.log('🔄 User clicked on model:', model);
         try {
-          await invoke('set_selected_prompt_model', { model });
+          await invoke('set_selected_prompt_model', { model, saveAsDefault: true });
           modelOptions.forEach(opt => opt.classList.remove('active'));
           option.classList.add('active');
           console.log('✅ Model saved to database:', model);

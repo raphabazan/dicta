@@ -8,10 +8,17 @@ interface TranscriptionEntry {
   timestamp: number;
 }
 
+interface StatsData {
+  total_words: number;
+  total_transcriptions: number;
+  total_duration_ms: number;
+  total_cost_cents: number;
+}
+
 function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [status, setStatus] = useState("Ready");
-  const [currentView, setCurrentView] = useState<"home" | "history" | "settings">("home");
+  const [currentView, setCurrentView] = useState<"home" | "history" | "stats" | "settings">("home");
   const [availableMicrophones, setAvailableMicrophones] = useState<string[]>([]);
   const [selectedMicrophone, setSelectedMicrophone] = useState<string>("");
   const [transcriptionHistory, setTranscriptionHistory] = useState<TranscriptionEntry[]>([]);
@@ -19,6 +26,9 @@ function App() {
   const [currentTranscript, setCurrentTranscript] = useState(""); // Real-time transcript display
   const [isStarting, setIsStarting] = useState(false); // Prevent duplicate start calls
   const [isStopping, setIsStopping] = useState(false); // Prevent duplicate stop calls
+  const [statsData, setStatsData] = useState<StatsData | null>(null);
+  const [statsRange, setStatsRange] = useState<"today" | "7days" | "month" | "year" | "all">("month");
+  const [showStatsDetails, setShowStatsDetails] = useState(false);
 
   // Refs to always have current values inside event listener closures
   const isRecordingRef = useRef(false);
@@ -158,6 +168,52 @@ function App() {
       setStatus("❌ Failed to select microphone");
     }
   };
+
+  const loadStats = async (range: typeof statsRange) => {
+    const now = Date.now();
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    let fromTs: number;
+    switch (range) {
+      case "today":
+        fromTs = startOfToday.getTime();
+        break;
+      case "7days":
+        fromTs = now - 7 * 24 * 60 * 60 * 1000;
+        break;
+      case "month": {
+        const d = new Date();
+        d.setDate(1);
+        d.setHours(0, 0, 0, 0);
+        fromTs = d.getTime();
+        break;
+      }
+      case "year": {
+        const d = new Date();
+        d.setMonth(0, 1);
+        d.setHours(0, 0, 0, 0);
+        fromTs = d.getTime();
+        break;
+      }
+      case "all":
+        fromTs = 0;
+        break;
+    }
+
+    try {
+      const data = await invoke<StatsData>("get_statistics", { fromTs, toTs: now });
+      setStatsData(data);
+    } catch (error) {
+      console.error("Failed to load stats:", error);
+    }
+  };
+
+  useEffect(() => {
+    if (currentView === "stats") {
+      loadStats(statsRange);
+    }
+  }, [currentView, statsRange]);
 
   useEffect(() => {
     // Load history and microphones on mount
@@ -322,6 +378,16 @@ function App() {
             Histórico ({transcriptionHistory.length})
           </button>
           <button
+            onClick={() => setCurrentView("stats")}
+            className={`flex-1 py-2 px-4 rounded transition-colors ${
+              currentView === "stats"
+                ? "bg-blue-600 text-white"
+                : "text-gray-400 hover:bg-gray-700"
+            }`}
+          >
+            Stats
+          </button>
+          <button
             onClick={() => setCurrentView("settings")}
             className={`flex-1 py-2 px-4 rounded transition-colors ${
               currentView === "settings"
@@ -439,6 +505,98 @@ function App() {
                   </div>
                 ))}
               </div>
+            )}
+          </div>
+        ) : currentView === "stats" ? (
+          <div className="bg-gray-800 rounded-lg p-6 space-y-6">
+            <div className="flex items-center justify-between">
+              <h2 className="text-xl font-semibold">Estatísticas</h2>
+              <div className="flex gap-1">
+                {([
+                  ["today", "Hoje"],
+                  ["7days", "7 Dias"],
+                  ["month", "Mês"],
+                  ["year", "Ano"],
+                  ["all", "Tudo"],
+                ] as const).map(([key, label]) => (
+                  <button
+                    key={key}
+                    onClick={() => setStatsRange(key)}
+                    className={`px-3 py-1 rounded text-xs transition-colors ${
+                      statsRange === key
+                        ? "bg-blue-600 text-white"
+                        : "bg-gray-700 text-gray-300 hover:bg-gray-600"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {statsData ? (
+              <>
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="bg-gray-700/50 rounded-lg p-4 text-center">
+                    <p className="text-2xl font-bold text-white">{statsData.total_words.toLocaleString("pt-BR")}</p>
+                    <p className="text-xs text-gray-400 mt-1">Palavras Ditadas</p>
+                  </div>
+                  <div className="bg-gray-700/50 rounded-lg p-4 text-center">
+                    <p className="text-2xl font-bold text-white">{statsData.total_transcriptions}</p>
+                    <p className="text-xs text-gray-400 mt-1">Sessões</p>
+                  </div>
+                  <div className="bg-gray-700/50 rounded-lg p-4 text-center">
+                    <p className="text-2xl font-bold text-white">
+                      {statsData.total_duration_ms > 0
+                        ? Math.round(statsData.total_words / (statsData.total_duration_ms / 60000))
+                        : 0}
+                    </p>
+                    <p className="text-xs text-gray-400 mt-1">Média WPM</p>
+                  </div>
+                  <div className="bg-gray-700/50 rounded-lg p-4 text-center">
+                    <p className="text-2xl font-bold text-white">
+                      ${(statsData.total_cost_cents / 10000).toFixed(4)}
+                    </p>
+                    <p className="text-xs text-gray-400 mt-1">Custo Est.</p>
+                  </div>
+                </div>
+
+                <button
+                  onClick={() => setShowStatsDetails(!showStatsDetails)}
+                  className="text-sm text-gray-400 hover:text-gray-200 transition-colors"
+                >
+                  {showStatsDetails ? "Ocultar Detalhes ▲" : "Mostrar Detalhes ▼"}
+                </button>
+
+                {showStatsDetails && (
+                  <div className="bg-gray-700/30 rounded-lg p-4 space-y-3 text-sm">
+                    <div className="flex justify-between">
+                      <span className="text-gray-400">Tempo Total de Gravação</span>
+                      <span className="text-white">
+                        {Math.floor(statsData.total_duration_ms / 60000)}m {Math.floor((statsData.total_duration_ms % 60000) / 1000)}s
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-400">Média por Sessão</span>
+                      <span className="text-white">
+                        {statsData.total_transcriptions > 0
+                          ? Math.round(statsData.total_words / statsData.total_transcriptions)
+                          : 0} palavras
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-gray-400">Duração Média</span>
+                      <span className="text-white">
+                        {statsData.total_transcriptions > 0
+                          ? Math.round(statsData.total_duration_ms / statsData.total_transcriptions / 1000)
+                          : 0}s
+                      </span>
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
+              <p className="text-gray-400 text-center py-8">Carregando...</p>
             )}
           </div>
         ) : (

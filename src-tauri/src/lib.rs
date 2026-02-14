@@ -2,6 +2,7 @@ mod audio;
 mod openai;
 mod realtime;
 mod db;
+mod system_audio;
 
 use tauri::{Emitter, Manager, State, AppHandle, PhysicalPosition};
 use tauri::menu::{Menu, MenuItem};
@@ -157,6 +158,11 @@ async fn cancel_recording(state: State<'_, AppState>) -> Result<String, String> 
     let _ = recorder.stop_recording(); // Discard audio data
     *is_recording = false;
 
+    // Restore system audio
+    if let Err(e) = system_audio::unmute_system_audio() {
+        eprintln!("⚠️ Failed to unmute system audio: {}", e);
+    }
+
     Ok("Recording cancelled".to_string())
 }
 
@@ -180,6 +186,11 @@ async fn start_recording_audio(state: State<'_, AppState>, app: AppHandle) -> Re
     let recorder = state.audio_recorder.lock().unwrap();
     recorder.start_recording(selected_mic)?;
     *is_recording = true;
+
+    // Mute system audio while recording
+    if let Err(e) = system_audio::mute_system_audio() {
+        eprintln!("⚠️ Failed to mute system audio: {}", e);
+    }
 
     // Spawn timer task for Whisper mode
     let is_recording_flag = state.is_recording.clone();
@@ -296,6 +307,15 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
     let audio_data = recorder.stop_recording();
     *is_recording = false;
 
+    // Restore system audio
+    if let Err(e) = system_audio::unmute_system_audio() {
+        eprintln!("⚠️ Failed to unmute system audio: {}", e);
+    }
+
+    // Capture recording duration for stats
+    let duration_ms = state.recording_start_time.lock().unwrap()
+        .map(|start| start.elapsed().as_millis() as i64);
+
     if audio_data.is_empty() {
         return Err("No audio recorded".to_string());
     }
@@ -333,8 +353,9 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap()
                                 .as_millis() as i64;
+                            let cost = estimate_cost_cents(&model, duration_ms, &gpt_response);
 
-                            if let Err(e) = database.save_transcription(&gpt_response, timestamp) {
+                            if let Err(e) = database.save_transcription(&gpt_response, timestamp, duration_ms, Some(&model), Some(cost), Some("prompt")) {
                                 eprintln!("❌ Failed to save to database: {}", e);
                             }
 
@@ -370,8 +391,9 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_millis() as i64;
+                    let cost = estimate_cost_cents("whisper", duration_ms, &transcribed_text);
 
-                    if let Err(e) = database.save_transcription(&transcribed_text, timestamp) {
+                    if let Err(e) = database.save_transcription(&transcribed_text, timestamp, duration_ms, Some("whisper"), Some(cost), Some("transcription")) {
                         eprintln!("❌ Failed to save to database: {}", e);
                     }
 
@@ -462,19 +484,19 @@ fn get_selected_microphone(state: State<'_, AppState>) -> Result<Option<String>,
 }
 
 #[tauri::command]
-fn set_selected_prompt_model(state: State<'_, AppState>, model: String) -> Result<(), String> {
+fn set_selected_prompt_model(state: State<'_, AppState>, model: String, save_as_default: Option<bool>) -> Result<(), String> {
     // Save as current session model
     state.database.save_setting("selected_prompt_model", &model)
         .map_err(|e| format!("Failed to save prompt model setting: {}", e))?;
 
-    // If user chose a GPT model (not transcribe-only), also remember it as their preferred prompt model
-    // so Ctrl+Shift+Space uses it next time
-    if model != "transcribe-only" {
+    // Only save as user_prompt_model (for Ctrl+Shift+Space) when explicitly requested
+    // This prevents Ctrl+B or Ctrl+Alt+Space from overwriting the user's preferred model
+    if save_as_default.unwrap_or(false) && model != "transcribe-only" {
         state.database.save_setting("user_prompt_model", &model)
             .map_err(|e| format!("Failed to save user prompt model: {}", e))?;
         println!("💾 Selected prompt model: {} (also saved as user_prompt_model)", model);
     } else {
-        println!("💾 Selected prompt model: transcribe-only (user_prompt_model unchanged)");
+        println!("💾 Selected prompt model: {} (user_prompt_model unchanged)", model);
     }
     Ok(())
 }
@@ -525,6 +547,28 @@ fn get_conversation_history(database: &db::Database) -> Vec<db::ConversationMess
     database.load_conversation_history(6).unwrap_or_default()
 }
 
+/// Estimate cost in hundredths of a cent based on model and usage
+fn estimate_cost_cents(model: &str, duration_ms: Option<i64>, text: &str) -> i64 {
+    match model {
+        "whisper" | "realtime" => {
+            // $0.006/min of audio
+            let minutes = duration_ms.unwrap_or(0) as f64 / 60_000.0;
+            (minutes * 0.006 * 10_000.0) as i64
+        }
+        "gpt-4o-mini" => {
+            // ~$0.60/1M output tokens, ~4 chars/token
+            let tokens = text.len() as f64 / 4.0;
+            (tokens * 0.60 / 1_000_000.0 * 10_000.0) as i64
+        }
+        "gpt-4.1" => {
+            // ~$8/1M output tokens
+            let tokens = text.len() as f64 / 4.0;
+            (tokens * 8.0 / 1_000_000.0 * 10_000.0) as i64
+        }
+        _ => 0,
+    }
+}
+
 #[tauri::command]
 async fn send_text_prompt(state: State<'_, AppState>, app: AppHandle, prompt: String, model: String) -> Result<(), String> {
     println!("{} 🤖 send_text_prompt called - model: {}, prompt: {}", ts(), model, &prompt[..prompt.len().min(80)]);
@@ -547,7 +591,8 @@ async fn send_text_prompt(state: State<'_, AppState>, app: AppHandle, prompt: St
                     .as_millis() as i64;
 
                 // Save to transcription history (for Alt+Shift+Z)
-                if let Err(e) = database.save_transcription(&response, timestamp) {
+                let cost = estimate_cost_cents(&model, None, &response);
+                if let Err(e) = database.save_transcription(&response, timestamp, None, Some(&model), Some(cost), Some("prompt")) {
                     eprintln!("❌ Failed to save text prompt response: {}", e);
                 }
 
@@ -585,6 +630,11 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
 
     println!("🎤 Starting realtime transcription...");
     *is_recording = true;
+
+    // Mute system audio while recording
+    if let Err(e) = system_audio::mute_system_audio() {
+        eprintln!("⚠️ Failed to mute system audio: {}", e);
+    }
 
     // Set recording start time
     *state.recording_start_time.lock().unwrap() = Some(Instant::now());
@@ -915,6 +965,15 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
         println!("✅ is_recording is now false");
     } // Drop lock before await
 
+    // Restore system audio
+    if let Err(e) = system_audio::unmute_system_audio() {
+        eprintln!("⚠️ Failed to unmute system audio: {}", e);
+    }
+
+    // Capture recording duration for stats
+    let duration_ms = state.recording_start_time.lock().unwrap()
+        .map(|start| start.elapsed().as_millis() as i64);
+
     // Wait for the internal spawn task to finish cleanup.
     // The spawn signals completion by setting is_recording_flag=false (different from AppState.is_recording).
     // We wait up to 5s for the spawn to finish its commit+transcription wait.
@@ -1014,7 +1073,8 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
                             .unwrap()
                             .as_millis() as i64;
 
-                        if let Err(e) = database.save_transcription(&gpt_response, timestamp) {
+                        let cost = estimate_cost_cents(&selected_model, duration_ms, &gpt_response);
+                        if let Err(e) = database.save_transcription(&gpt_response, timestamp, duration_ms, Some(&selected_model), Some(cost), Some("prompt")) {
                             eprintln!("❌ Failed to save to database: {}", e);
                         }
 
@@ -1047,7 +1107,8 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
                 .unwrap()
                 .as_millis() as i64;
 
-            if let Err(e) = state.database.save_transcription(&transcript, timestamp) {
+            let cost = estimate_cost_cents("realtime", duration_ms, &transcript);
+            if let Err(e) = state.database.save_transcription(&transcript, timestamp, duration_ms, Some("realtime"), Some(cost), Some("transcription")) {
                 eprintln!("❌ Failed to save to database: {}", e);
             }
 
@@ -1072,6 +1133,12 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
     }
 
     Ok("Realtime recording stopped".to_string())
+}
+
+#[tauri::command]
+async fn get_statistics(state: State<'_, AppState>, from_ts: i64, to_ts: i64) -> Result<db::StatsData, String> {
+    state.database.get_stats(from_ts, to_ts)
+        .map_err(|e| format!("Failed to get stats: {}", e))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1419,7 +1486,8 @@ pub fn run() {
             set_selected_prompt_model,
             get_selected_prompt_model,
             get_current_recording_mode,
-            send_text_prompt
+            send_text_prompt,
+            get_statistics
         ])
         .setup(|app| {
             // Create tray menu
@@ -1467,6 +1535,9 @@ pub fn run() {
                     }
                 });
             }
+
+            // Clear any stale mute from a previous crash
+            let _ = system_audio::unmute_system_audio();
 
             // Register global hotkeys
             let shortcut_record = Shortcut::new(Some(Modifiers::CONTROL), Code::Space);

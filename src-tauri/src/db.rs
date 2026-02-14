@@ -8,6 +8,10 @@ pub struct TranscriptionEntry {
     pub id: Option<i64>,
     pub text: String,
     pub timestamp: i64, // Unix timestamp in milliseconds
+    pub duration_ms: Option<i64>,
+    pub model: Option<String>,
+    pub cost_cents: Option<i64>, // hundredths of a cent for precision
+    pub mode: Option<String>,    // "transcription" or "prompt"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +19,14 @@ pub struct ConversationMessage {
     pub role: String,    // "user" or "assistant"
     pub content: String,
     pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsData {
+    pub total_words: i64,
+    pub total_transcriptions: i64,
+    pub total_duration_ms: i64,
+    pub total_cost_cents: i64,
 }
 
 pub struct Database {
@@ -62,6 +74,30 @@ impl Database {
             [],
         )?;
 
+        // Schema migration v1: add stats columns to transcriptions
+        let schema_version: i64 = conn
+            .query_row(
+                "SELECT COALESCE(
+                    (SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'schema_version'),
+                    0
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if schema_version < 1 {
+            conn.execute("ALTER TABLE transcriptions ADD COLUMN duration_ms INTEGER", [])?;
+            conn.execute("ALTER TABLE transcriptions ADD COLUMN model TEXT", [])?;
+            conn.execute("ALTER TABLE transcriptions ADD COLUMN cost_cents INTEGER", [])?;
+            conn.execute("ALTER TABLE transcriptions ADD COLUMN mode TEXT DEFAULT 'transcription'", [])?;
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('schema_version', '1')",
+                [],
+            )?;
+            println!("📦 Database migrated to schema version 1 (added stats columns)");
+        }
+
         println!("✅ Database initialized");
 
         Ok(Self {
@@ -70,16 +106,25 @@ impl Database {
     }
 
     /// Save a new transcription to the database
-    pub fn save_transcription(&self, text: &str, timestamp: i64) -> Result<i64> {
+    pub fn save_transcription(
+        &self,
+        text: &str,
+        timestamp: i64,
+        duration_ms: Option<i64>,
+        model: Option<&str>,
+        cost_cents: Option<i64>,
+        mode: Option<&str>,
+    ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
 
         conn.execute(
-            "INSERT INTO transcriptions (text, timestamp) VALUES (?1, ?2)",
-            [text, &timestamp.to_string()],
+            "INSERT INTO transcriptions (text, timestamp, duration_ms, model, cost_cents, mode)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![text, timestamp, duration_ms, model, cost_cents, mode],
         )?;
 
         let id = conn.last_insert_rowid();
-        println!("💾 Saved transcription to DB (id: {})", id);
+        println!("💾 Saved transcription to DB (id: {}, model: {:?}, cost: {:?})", id, model, cost_cents);
 
         Ok(id)
     }
@@ -89,7 +134,8 @@ impl Database {
         let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
-            "SELECT id, text, timestamp FROM transcriptions ORDER BY timestamp DESC"
+            "SELECT id, text, timestamp, duration_ms, model, cost_cents, mode
+             FROM transcriptions ORDER BY timestamp DESC",
         )?;
 
         let entries = stmt
@@ -98,6 +144,10 @@ impl Database {
                     id: Some(row.get(0)?),
                     text: row.get(1)?,
                     timestamp: row.get(2)?,
+                    duration_ms: row.get(3)?,
+                    model: row.get(4)?,
+                    cost_cents: row.get(5)?,
+                    mode: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>>>()?;
@@ -179,7 +229,7 @@ impl Database {
             "SELECT role, content, timestamp FROM (
                 SELECT role, content, timestamp FROM conversation_history
                 ORDER BY timestamp DESC LIMIT ?1
-             ) ORDER BY timestamp ASC"
+             ) ORDER BY timestamp ASC",
         )?;
 
         let messages = stmt
@@ -216,5 +266,57 @@ impl Database {
         conn.execute("DELETE FROM conversation_history", [])?;
         println!("🗑️ Conversation history cleared");
         Ok(())
+    }
+
+    /// Clear all transcriptions
+    pub fn clear_transcriptions(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM transcriptions", [])?;
+        println!("🗑️ All transcriptions cleared");
+        Ok(())
+    }
+
+    /// Get statistics for a date range
+    pub fn get_stats(&self, from_ts: i64, to_ts: i64) -> Result<StatsData> {
+        let conn = self.conn.lock().unwrap();
+
+        let total_transcriptions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM transcriptions WHERE timestamp >= ?1 AND timestamp <= ?2",
+            rusqlite::params![from_ts, to_ts],
+            |row| row.get(0),
+        )?;
+
+        let total_duration_ms: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(duration_ms), 0) FROM transcriptions
+             WHERE timestamp >= ?1 AND timestamp <= ?2",
+            rusqlite::params![from_ts, to_ts],
+            |row| row.get(0),
+        )?;
+
+        let total_cost_cents: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(cost_cents), 0) FROM transcriptions
+             WHERE timestamp >= ?1 AND timestamp <= ?2",
+            rusqlite::params![from_ts, to_ts],
+            |row| row.get(0),
+        )?;
+
+        // Word count: load texts and count in Rust
+        let mut stmt = conn.prepare(
+            "SELECT text FROM transcriptions WHERE timestamp >= ?1 AND timestamp <= ?2",
+        )?;
+        let texts: Vec<String> = stmt
+            .query_map(rusqlite::params![from_ts, to_ts], |row| row.get(0))?
+            .collect::<Result<Vec<_>>>()?;
+        let total_words: i64 = texts
+            .iter()
+            .map(|t| t.split_whitespace().count() as i64)
+            .sum();
+
+        Ok(StatsData {
+            total_words,
+            total_transcriptions,
+            total_duration_ms,
+            total_cost_cents,
+        })
     }
 }
