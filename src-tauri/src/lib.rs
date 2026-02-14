@@ -500,6 +500,48 @@ fn get_current_recording_mode(state: State<'_, AppState>) -> Result<String, Stri
 // Removed start_pre_buffering - pre-buffering logic moved to audio capture
 
 #[tauri::command]
+async fn send_text_prompt(state: State<'_, AppState>, app: AppHandle, prompt: String, model: String) -> Result<(), String> {
+    println!("{} 🤖 send_text_prompt called - model: {}, prompt: {}", ts(), model, &prompt[..prompt.len().min(80)]);
+
+    let openai = state.openai_client.clone();
+    let database = state.database.clone();
+    let last_transcription = state.last_transcription.clone();
+    let app_handle = app.clone();
+
+    tokio::spawn(async move {
+        match openai.send_prompt(&prompt, &model).await {
+            Ok(response) => {
+                println!("{} ✅ Text prompt response: {}", ts(), &response[..response.len().min(80)]);
+                // Save to history
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64;
+                if let Err(e) = database.save_transcription(&response, timestamp) {
+                    eprintln!("❌ Failed to save text prompt response: {}", e);
+                }
+                *last_transcription.lock().unwrap() = Some(response.clone());
+
+                // Notify frontend to refresh history
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.emit("history-updated", ());
+                }
+
+                // Auto-paste response
+                if let Err(e) = auto_paste_text(&app_handle, &response) {
+                    eprintln!("❌ Failed to paste text prompt response: {}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Text prompt failed: {}", e);
+            }
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
 async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> Result<String, String> {
     let mut is_recording = state.is_recording.lock().unwrap();
     if *is_recording {
@@ -1238,9 +1280,25 @@ pub fn run() {
                         } else {
                             println!("⏭️ Ctrl+Space ignored (debounce - too fast)");
                         }
+                    } else if shortcut_str.contains("KeyB") && shortcut_str.contains("CONTROL") {
+                        // Ctrl+B: Open prompt input window
+                        tlog!("🔥 Hotkey pressed: Ctrl+B");
+                        if let Some(prompt_window) = app.get_webview_window("prompt-input") {
+                            if let Ok(monitor) = prompt_window.current_monitor() {
+                                if let Some(monitor) = monitor {
+                                    let screen_size = monitor.size();
+                                    let win_width = 400i32;
+                                    let win_height = 160i32;
+                                    let x = (screen_size.width as i32 - win_width) / 2;
+                                    let y = screen_size.height as i32 - win_height - 200;
+                                    let _ = prompt_window.set_position(PhysicalPosition::new(x, y));
+                                }
+                            }
+                            let _ = prompt_window.show();
+                        }
                     } else if shortcut_str.contains("KeyZ") {
                         // Alt+Shift+Z: Get last transcription from history and paste it
-                        println!("🔥 Hotkey pressed: Alt+Shift+Z");
+                        tlog!("🔥 Hotkey pressed: Alt+Shift+Z");
 
                         // Get app state
                         if let Some(state) = app.try_state::<AppState>() {
@@ -1318,7 +1376,8 @@ pub fn run() {
             get_selected_microphone,
             set_selected_prompt_model,
             get_selected_prompt_model,
-            get_current_recording_mode
+            get_current_recording_mode,
+            send_text_prompt
         ])
         .setup(|app| {
             // Create tray menu
@@ -1383,11 +1442,15 @@ pub fn run() {
             );
             app.global_shortcut().register(shortcut_paste).unwrap();
 
+            let shortcut_prompt_input = Shortcut::new(Some(Modifiers::CONTROL), Code::KeyB);
+            app.global_shortcut().register(shortcut_prompt_input).unwrap();
+
             println!("✅ Dicta is running!");
             println!("📌 Press Ctrl+Space to start/stop recording");
             println!("📌 Press Ctrl+Shift+Space for GPT-4o-mini prompt mode");
             println!("📌 Press Ctrl+Alt+Space for GPT-4.1 prompt mode");
             println!("📌 Press Alt+Shift+Z to paste last transcription");
+            println!("📌 Press Ctrl+B to open prompt input window");
             println!("🔑 OpenAI API key loaded");
 
             Ok(())

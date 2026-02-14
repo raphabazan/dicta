@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Prompt Input</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      width: 400px;
+      height: 160px;
+      overflow: hidden;
+      background: transparent;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+    body::-webkit-scrollbar { display: none; }
+    body { -ms-overflow-style: none; scrollbar-width: none; }
+
+    .container {
+      width: 400px;
+      height: 160px;
+      background: rgba(17, 24, 39, 0.97);
+      border: 1px solid rgba(99, 102, 241, 0.5);
+      border-radius: 12px;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+      backdrop-filter: blur(12px);
+      display: flex;
+      flex-direction: column;
+      padding: 12px;
+      gap: 8px;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: move;
+      user-select: none;
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1;
+    }
+
+    .title {
+      color: rgba(255,255,255,0.6);
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    select.model-select {
+      background: rgba(99, 102, 241, 0.15);
+      border: 1px solid rgba(99, 102, 241, 0.35);
+      border-radius: 6px;
+      color: rgba(255,255,255,0.85);
+      font-size: 11px;
+      padding: 2px 6px;
+      cursor: pointer;
+      outline: none;
+      appearance: none;
+      -webkit-appearance: none;
+    }
+    select.model-select option {
+      background: #1f2937;
+      color: white;
+    }
+    select.model-select:focus {
+      border-color: rgba(99, 102, 241, 0.7);
+    }
+
+    .close-btn {
+      width: 20px;
+      height: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: transparent;
+      border: none;
+      border-radius: 50%;
+      cursor: pointer;
+      color: rgba(255,255,255,0.4);
+      font-size: 14px;
+      line-height: 1;
+      transition: all 0.15s;
+      flex-shrink: 0;
+    }
+    .close-btn:hover {
+      background: rgba(107, 114, 128, 0.4);
+      color: rgba(255,255,255,0.8);
+    }
+
+    .input-row {
+      display: flex;
+      gap: 8px;
+      flex: 1;
+    }
+
+    textarea.prompt-input {
+      flex: 1;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(99, 102, 241, 0.3);
+      border-radius: 8px;
+      color: white;
+      font-size: 13px;
+      padding: 8px 10px;
+      resize: none;
+      outline: none;
+      font-family: system-ui, -apple-system, sans-serif;
+      line-height: 1.4;
+      transition: border-color 0.15s;
+    }
+    textarea.prompt-input::placeholder {
+      color: rgba(255,255,255,0.25);
+    }
+    textarea.prompt-input:focus {
+      border-color: rgba(99, 102, 241, 0.6);
+    }
+
+    .send-btn {
+      width: 36px;
+      height: 36px;
+      align-self: flex-end;
+      background: #6366f1;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.15s;
+      flex-shrink: 0;
+    }
+    .send-btn:hover { background: #818cf8; transform: scale(1.05); }
+    .send-btn:disabled { background: rgba(99,102,241,0.3); cursor: not-allowed; transform: none; }
+    .send-btn svg { width: 16px; height: 16px; fill: white; }
+
+    .status {
+      font-size: 10px;
+      color: rgba(255,255,255,0.35);
+      text-align: right;
+      min-height: 14px;
+    }
+    .status.loading { color: rgba(99,102,241,0.8); }
+    .status.error { color: rgba(239,68,68,0.8); }
+
+    .drag-region {
+      flex: 1;
+      cursor: move;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header" data-tauri-drag-region>
+      <div class="header-left" data-tauri-drag-region>
+        <span class="title" data-tauri-drag-region>Prompt</span>
+        <select class="model-select" id="modelSelect">
+          <option value="gpt-4.1">GPT-4.1</option>
+          <option value="gpt-4o-mini">GPT-4o-mini</option>
+        </select>
+      </div>
+      <div class="drag-region" data-tauri-drag-region></div>
+      <button class="close-btn" id="closeBtn" title="Fechar (Esc)">✕</button>
+    </div>
+
+    <div class="input-row">
+      <textarea
+        class="prompt-input"
+        id="promptInput"
+        placeholder="Digite ou cole seu prompt aqui... (Enter para enviar)"
+        rows="3"
+      ></textarea>
+      <button class="send-btn" id="sendBtn" title="Enviar (Enter)">
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+        </svg>
+      </button>
+    </div>
+
+    <div class="status" id="status">Ctrl+Enter para nova linha</div>
+  </div>
+
+  <script type="module">
+    import { invoke } from '@tauri-apps/api/core';
+    import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+
+    const currentWindow = getCurrentWebviewWindow();
+    const promptInput = document.getElementById('promptInput');
+    const sendBtn = document.getElementById('sendBtn');
+    const closeBtn = document.getElementById('closeBtn');
+    const modelSelect = document.getElementById('modelSelect');
+    const statusEl = document.getElementById('status');
+
+    // Load saved model preference
+    async function loadModel() {
+      try {
+        const model = await invoke('get_selected_prompt_model');
+        if (model && (model === 'gpt-4.1' || model === 'gpt-4o-mini')) {
+          modelSelect.value = model;
+        } else {
+          modelSelect.value = 'gpt-4.1'; // default
+        }
+      } catch (e) {
+        modelSelect.value = 'gpt-4.1';
+      }
+    }
+
+    async function sendPrompt() {
+      const text = promptInput.value.trim();
+      if (!text) return;
+
+      const model = modelSelect.value;
+
+      // Save model preference
+      try {
+        await invoke('set_selected_prompt_model', { model });
+      } catch (e) {}
+
+      sendBtn.disabled = true;
+      promptInput.disabled = true;
+      statusEl.textContent = `Enviando para ${model}...`;
+      statusEl.className = 'status loading';
+
+      // Hide window immediately so user can see where it will paste
+      await currentWindow.hide();
+
+      try {
+        await invoke('send_text_prompt', { prompt: text, model });
+        statusEl.textContent = 'Resposta colada!';
+        statusEl.className = 'status';
+      } catch (e) {
+        console.error('Failed to send prompt:', e);
+        statusEl.textContent = 'Erro ao enviar';
+        statusEl.className = 'status error';
+        await currentWindow.show();
+      } finally {
+        sendBtn.disabled = false;
+        promptInput.disabled = false;
+        promptInput.value = '';
+        promptInput.focus();
+      }
+    }
+
+    // Enter to send, Ctrl+Enter for newline
+    promptInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.ctrlKey && !e.shiftKey) {
+        e.preventDefault();
+        sendPrompt();
+      }
+      if (e.key === 'Escape') {
+        currentWindow.hide();
+      }
+    });
+
+    closeBtn.addEventListener('click', () => currentWindow.hide());
+    sendBtn.addEventListener('click', sendPrompt);
+
+    // Model change saves preference
+    modelSelect.addEventListener('change', async () => {
+      const model = modelSelect.value;
+      try {
+        await invoke('set_selected_prompt_model', { model });
+      } catch (e) {}
+    });
+
+    // Focus input when window shows
+    window.addEventListener('focus', () => {
+      promptInput.focus();
+      loadModel();
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) {
+        promptInput.focus();
+        loadModel();
+      }
+    });
+
+    loadModel();
+    promptInput.focus();
+  </script>
+</body>
+</html>

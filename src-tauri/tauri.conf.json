@@ -44,6 +44,22 @@
         "shadow": false
       },
       {
+        "label": "prompt-input",
+        "title": "Prompt",
+        "url": "prompt-input.html",
+        "width": 400,
+        "height": 160,
+        "resizable": false,
+        "fullscreen": false,
+        "visible": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "transparent": true,
+        "dragDropEnabled": false,
+        "shadow": false
+      },
+      {
         "label": "warning-widget",
         "title": "Warning",
         "url": "warning.html",
@@ -64,7 +80,7 @@
         {
           "identifier": "main-capability",
           "description": "Capability for main window",
-          "windows": ["main", "recording-widget", "warning-widget"],
+          "windows": ["main", "recording-widget", "warning-widget", "prompt-input"],
           "permissions": [
             "core:event:allow-listen",
             "core:event:allow-unlisten",
