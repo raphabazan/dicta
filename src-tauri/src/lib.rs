@@ -303,6 +303,9 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
     // Check if we're in prompt mode
     let prompt_mode = state.prompt_mode.lock().unwrap().clone();
 
+    // Load conversation history before spawning (inactivity check happens here)
+    let conv_history = get_conversation_history(&state.database);
+
     // Transcribe (without post-processing for speed)
     let openai = state.openai_client.clone();
     let last_transcription = state.last_transcription.clone();
@@ -318,7 +321,7 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
                     println!("🤖 Prompt mode active with model: {}", model);
 
                     // Send transcribed text as prompt to GPT
-                    match openai.send_prompt(&transcribed_text, &model).await {
+                    match openai.send_prompt(&transcribed_text, &model, &conv_history).await {
                         Ok(gpt_response) => {
                             println!("✨ GPT Response: {}", gpt_response);
 
@@ -334,6 +337,10 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
                             if let Err(e) = database.save_transcription(&gpt_response, timestamp) {
                                 eprintln!("❌ Failed to save to database: {}", e);
                             }
+
+                            // Save to conversation history
+                            let _ = database.append_conversation("user", &transcribed_text, timestamp - 1);
+                            let _ = database.append_conversation("assistant", &gpt_response, timestamp);
 
                             // Notify frontend
                             if let Some(window) = app_handle.get_webview_window("main") {
@@ -499,6 +506,25 @@ fn get_current_recording_mode(state: State<'_, AppState>) -> Result<String, Stri
 
 // Removed start_pre_buffering - pre-buffering logic moved to audio capture
 
+/// Load conversation history, clearing it first if inactive for 30+ minutes.
+fn get_conversation_history(database: &db::Database) -> Vec<db::ConversationMessage> {
+    const INACTIVITY_MS: i64 = 30 * 60 * 1000; // 30 minutes
+
+    if let Ok(Some(last_ts)) = database.last_conversation_timestamp() {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        if now_ms - last_ts > INACTIVITY_MS {
+            tlog!("🕐 Conversation inactive >30min, clearing history");
+            let _ = database.clear_conversation_history();
+            return vec![];
+        }
+    }
+
+    database.load_conversation_history(6).unwrap_or_default()
+}
+
 #[tauri::command]
 async fn send_text_prompt(state: State<'_, AppState>, app: AppHandle, prompt: String, model: String) -> Result<(), String> {
     println!("{} 🤖 send_text_prompt called - model: {}, prompt: {}", ts(), model, &prompt[..prompt.len().min(80)]);
@@ -508,18 +534,27 @@ async fn send_text_prompt(state: State<'_, AppState>, app: AppHandle, prompt: St
     let last_transcription = state.last_transcription.clone();
     let app_handle = app.clone();
 
+    // Load conversation history before spawning
+    let conv_history = get_conversation_history(&state.database);
+
     tokio::spawn(async move {
-        match openai.send_prompt(&prompt, &model).await {
+        match openai.send_prompt(&prompt, &model, &conv_history).await {
             Ok(response) => {
                 println!("{} ✅ Text prompt response: {}", ts(), &response[..response.len().min(80)]);
-                // Save to history
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as i64;
+
+                // Save to transcription history (for Alt+Shift+Z)
                 if let Err(e) = database.save_transcription(&response, timestamp) {
                     eprintln!("❌ Failed to save text prompt response: {}", e);
                 }
+
+                // Save to conversation history
+                let _ = database.append_conversation("user", &prompt, timestamp - 1);
+                let _ = database.append_conversation("assistant", &response, timestamp);
+
                 *last_transcription.lock().unwrap() = Some(response.clone());
 
                 // Notify frontend to refresh history
@@ -958,6 +993,9 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
         if should_use_prompt {
             println!("🤖 [REALTIME] Prompt mode active with model: {}", selected_model);
 
+            // Load conversation history before spawning
+            let conv_history = get_conversation_history(&state.database);
+
             // Send transcript as prompt to GPT
             let openai = state.openai_client.clone();
             let database = state.database.clone();
@@ -966,7 +1004,7 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
             let transcript_clone = transcript.clone();
 
             tokio::spawn(async move {
-                match openai.send_prompt(&transcript_clone, &selected_model).await {
+                match openai.send_prompt(&transcript_clone, &selected_model, &conv_history).await {
                     Ok(gpt_response) => {
                         println!("✨ GPT Response: {}", gpt_response);
 
@@ -979,6 +1017,10 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
                         if let Err(e) = database.save_transcription(&gpt_response, timestamp) {
                             eprintln!("❌ Failed to save to database: {}", e);
                         }
+
+                        // Save to conversation history
+                        let _ = database.append_conversation("user", &transcript_clone, timestamp - 1);
+                        let _ = database.append_conversation("assistant", &gpt_response, timestamp);
 
                         // Update last transcription with GPT response
                         *last_transcription.lock().unwrap() = Some(gpt_response.clone());

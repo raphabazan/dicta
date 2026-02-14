@@ -157,8 +157,9 @@ impl OpenAIClient {
     }
 
     /// Send prompt to GPT model and get response with web search enabled
-    pub async fn send_prompt(&self, prompt: &str, model: &str) -> Result<String, String> {
-        println!("🤖 Sending prompt to {} with web search...", model);
+    /// history: previous (user, assistant) pairs in chronological order
+    pub async fn send_prompt(&self, prompt: &str, model: &str, history: &[crate::db::ConversationMessage]) -> Result<String, String> {
+        println!("🤖 Sending prompt to {} (history: {} messages)...", model, history.len());
         println!("📝 Prompt: {}", prompt);
 
         // Map model names to their correct identifiers
@@ -169,13 +170,28 @@ impl OpenAIClient {
             _ => model
         };
 
+        let system_prompt = "You are a helpful assistant. When the user asks you to write, rewrite, translate, or improve a message, email, or text, respond with ONLY the final text, no introduction, no explanation. If the request is a question or needs an explanation, answer normally. Never use markdown formatting in your responses. Never use em dashes in your responses.";
+
+        // Build input array: history messages + current prompt
+        let mut input: Vec<serde_json::Value> = history.iter().map(|msg| {
+            json!({
+                "role": msg.role,
+                "content": msg.content
+            })
+        }).collect();
+        input.push(json!({
+            "role": "user",
+            "content": prompt
+        }));
+
         let body = json!({
             "model": api_model,
             "tools": [
                 {"type": "web_search"}
             ],
             "tool_choice": "auto",
-            "input": prompt
+            "instructions": system_prompt,
+            "input": input
         });
 
         let response = self
