@@ -55,3 +55,30 @@ export function playCancelSound() {
   oscillator.start(audioContext.currentTime);
   oscillator.stop(audioContext.currentTime + 0.1);
 }
+
+export function playResponseSound() {
+  const audioContext = new AudioContext();
+
+  // First chime: 880Hz
+  const osc1 = audioContext.createOscillator();
+  const gain1 = audioContext.createGain();
+  osc1.connect(gain1);
+  gain1.connect(audioContext.destination);
+  osc1.frequency.setValueAtTime(880, audioContext.currentTime);
+  gain1.gain.setValueAtTime(0.3, audioContext.currentTime);
+  gain1.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.12);
+  osc1.start(audioContext.currentTime);
+  osc1.stop(audioContext.currentTime + 0.12);
+
+  // Second chime: 1100Hz (slightly delayed)
+  const osc2 = audioContext.createOscillator();
+  const gain2 = audioContext.createGain();
+  osc2.connect(gain2);
+  gain2.connect(audioContext.destination);
+  osc2.frequency.setValueAtTime(1100, audioContext.currentTime + 0.1);
+  gain2.gain.setValueAtTime(0.01, audioContext.currentTime);
+  gain2.gain.setValueAtTime(0.3, audioContext.currentTime + 0.1);
+  gain2.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.25);
+  osc2.start(audioContext.currentTime + 0.1);
+  osc2.stop(audioContext.currentTime + 0.25);
+}

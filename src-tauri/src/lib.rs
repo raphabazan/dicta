@@ -341,7 +341,7 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
                     println!("🤖 Prompt mode active with model: {}", model);
 
                     // Send transcribed text as prompt to GPT
-                    match openai.send_prompt(&transcribed_text, &model, &conv_history).await {
+                    match openai.send_prompt(&transcribed_text, &model, &conv_history, None).await {
                         Ok(gpt_response) => {
                             println!("✨ GPT Response: {}", gpt_response);
 
@@ -378,6 +378,11 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
                                     }
                                 }
                             }
+
+                            // Notification sound
+                            if let Some(window) = app_handle.get_webview_window("main") {
+                                let _ = window.emit("response-ready", ());
+                            }
                         }
                         Err(e) => eprintln!("❌ GPT prompt error: {}", e),
                     }
@@ -412,6 +417,11 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
                                 let _ = window.emit("paste-failed", ());
                             }
                         }
+                    }
+
+                    // Notification sound
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.emit("response-ready", ());
                     }
                 }
             }
@@ -570,8 +580,8 @@ fn estimate_cost_cents(model: &str, duration_ms: Option<i64>, text: &str) -> i64
 }
 
 #[tauri::command]
-async fn send_text_prompt(state: State<'_, AppState>, app: AppHandle, prompt: String, model: String) -> Result<(), String> {
-    println!("{} 🤖 send_text_prompt called - model: {}, prompt: {}", ts(), model, &prompt[..prompt.len().min(80)]);
+async fn send_text_prompt(state: State<'_, AppState>, app: AppHandle, prompt: String, model: String, image_data: Option<String>) -> Result<(), String> {
+    println!("{} 🤖 send_text_prompt called - model: {}, image: {}, prompt: {}", ts(), model, image_data.is_some(), &prompt[..prompt.len().min(80)]);
 
     let openai = state.openai_client.clone();
     let database = state.database.clone();
@@ -582,7 +592,7 @@ async fn send_text_prompt(state: State<'_, AppState>, app: AppHandle, prompt: St
     let conv_history = get_conversation_history(&state.database);
 
     tokio::spawn(async move {
-        match openai.send_prompt(&prompt, &model, &conv_history).await {
+        match openai.send_prompt(&prompt, &model, &conv_history, image_data.as_deref()).await {
             Ok(response) => {
                 println!("{} ✅ Text prompt response: {}", ts(), &response[..response.len().min(80)]);
                 let timestamp = std::time::SystemTime::now()
@@ -610,6 +620,11 @@ async fn send_text_prompt(state: State<'_, AppState>, app: AppHandle, prompt: St
                 // Auto-paste response
                 if let Err(e) = auto_paste_text(&app_handle, &response) {
                     eprintln!("❌ Failed to paste text prompt response: {}", e);
+                }
+
+                // Notify frontend that response is ready (for notification sound)
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.emit("response-ready", ());
                 }
             }
             Err(e) => {
@@ -1063,7 +1078,7 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
             let transcript_clone = transcript.clone();
 
             tokio::spawn(async move {
-                match openai.send_prompt(&transcript_clone, &selected_model, &conv_history).await {
+                match openai.send_prompt(&transcript_clone, &selected_model, &conv_history, None).await {
                     Ok(gpt_response) => {
                         println!("✨ GPT Response: {}", gpt_response);
 
@@ -1095,6 +1110,11 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
                             Ok(_) => println!("✅ GPT response auto-pasted"),
                             Err(e) => eprintln!("⚠️ Auto-paste failed: {}", e),
                         }
+
+                        // Notification sound
+                        if let Some(window) = app_clone.get_webview_window("main") {
+                            let _ = window.emit("response-ready", ());
+                        }
                     }
                     Err(e) => eprintln!("❌ GPT prompt error: {}", e),
                 }
@@ -1123,10 +1143,16 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
             // Auto-paste the full session transcript
             let app_clone = app.clone();
             let text_clone = transcript.clone();
+            let app_for_sound = app.clone();
             std::thread::spawn(move || {
                 match auto_paste_text(&app_clone, &text_clone) {
                     Ok(_) => println!("✅ Session transcript auto-pasted"),
                     Err(e) => eprintln!("⚠️ Auto-paste failed: {}", e),
+                }
+
+                // Notification sound
+                if let Some(window) = app_for_sound.get_webview_window("main") {
+                    let _ = window.emit("response-ready", ());
                 }
             });
         }

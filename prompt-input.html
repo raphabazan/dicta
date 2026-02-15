@@ -153,6 +153,46 @@
       flex: 1;
       cursor: move;
     }
+
+    .image-preview {
+      display: none;
+      position: relative;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(99, 102, 241, 0.25);
+      border-radius: 8px;
+      padding: 6px;
+      align-items: center;
+      gap: 8px;
+    }
+    .image-preview.visible { display: flex; }
+    .image-preview img {
+      max-height: 80px;
+      max-width: 120px;
+      border-radius: 4px;
+      object-fit: contain;
+    }
+    .image-preview .image-info {
+      flex: 1;
+      color: rgba(255,255,255,0.5);
+      font-size: 10px;
+    }
+    .image-preview .remove-image {
+      width: 18px;
+      height: 18px;
+      background: rgba(239, 68, 68, 0.3);
+      border: none;
+      border-radius: 50%;
+      color: rgba(255,255,255,0.7);
+      font-size: 11px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: background 0.15s;
+    }
+    .image-preview .remove-image:hover {
+      background: rgba(239, 68, 68, 0.6);
+    }
   </style>
 </head>
 <body>
@@ -167,6 +207,12 @@
       </div>
       <div class="drag-region" data-tauri-drag-region></div>
       <button class="close-btn" id="closeBtn" title="Fechar (Esc)">✕</button>
+    </div>
+
+    <div class="image-preview" id="imagePreview">
+      <img id="imageThumb" src="" alt="preview">
+      <span class="image-info" id="imageInfo">Imagem anexada</span>
+      <button class="remove-image" id="removeImage" title="Remover imagem">✕</button>
     </div>
 
     <div class="input-row">
@@ -189,6 +235,7 @@
   <script type="module">
     import { invoke } from '@tauri-apps/api/core';
     import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+    import { LogicalSize } from '@tauri-apps/api/dpi';
 
     const currentWindow = getCurrentWebviewWindow();
     const promptInput = document.getElementById('promptInput');
@@ -196,6 +243,28 @@
     const closeBtn = document.getElementById('closeBtn');
     const modelSelect = document.getElementById('modelSelect');
     const statusEl = document.getElementById('status');
+    const imagePreview = document.getElementById('imagePreview');
+    const imageThumb = document.getElementById('imageThumb');
+    const imageInfo = document.getElementById('imageInfo');
+    const removeImageBtn = document.getElementById('removeImage');
+
+    let attachedImageData = null; // base64 string when image is attached
+
+    function attachImage(base64Data) {
+      attachedImageData = base64Data;
+      imageThumb.src = `data:image/png;base64,${base64Data}`;
+      const sizeKB = Math.round(base64Data.length * 3 / 4 / 1024);
+      imageInfo.textContent = `Imagem (${sizeKB} KB)`;
+      imagePreview.classList.add('visible');
+      currentWindow.setSize(new LogicalSize(400, 260));
+    }
+
+    function removeImage() {
+      attachedImageData = null;
+      imageThumb.src = '';
+      imagePreview.classList.remove('visible');
+      currentWindow.setSize(new LogicalSize(400, 160));
+    }
 
     // Load saved model preference
     async function loadModel() {
@@ -231,7 +300,11 @@
       await currentWindow.hide();
 
       try {
-        await invoke('send_text_prompt', { prompt: text, model });
+        const args = { prompt: text, model };
+        if (attachedImageData) {
+          args.imageData = attachedImageData;
+        }
+        await invoke('send_text_prompt', args);
         statusEl.textContent = 'Resposta colada!';
         statusEl.className = 'status';
       } catch (e) {
@@ -243,6 +316,7 @@
         sendBtn.disabled = false;
         promptInput.disabled = false;
         promptInput.value = '';
+        removeImage();
         promptInput.focus();
       }
     }
@@ -260,6 +334,31 @@
 
     closeBtn.addEventListener('click', () => currentWindow.hide());
     sendBtn.addEventListener('click', sendPrompt);
+    removeImageBtn.addEventListener('click', removeImage);
+
+    // Paste image from clipboard
+    promptInput.addEventListener('paste', (e) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      for (const item of items) {
+        if (item.type.startsWith('image/')) {
+          e.preventDefault();
+          const blob = item.getAsFile();
+          if (!blob) return;
+
+          const reader = new FileReader();
+          reader.onload = () => {
+            // result is "data:image/png;base64,..."
+            const dataUrl = reader.result;
+            const base64 = dataUrl.split(',')[1];
+            attachImage(base64);
+          };
+          reader.readAsDataURL(blob);
+          return; // Only handle first image
+        }
+      }
+    });
 
     // Model change saves preference
     modelSelect.addEventListener('change', async () => {
@@ -273,6 +372,8 @@
     window.addEventListener('focus', () => {
       promptInput.focus();
       loadModel();
+      // Clear image from previous session
+      if (attachedImageData) removeImage();
     });
 
     document.addEventListener('visibilitychange', () => {

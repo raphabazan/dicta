@@ -158,8 +158,8 @@ impl OpenAIClient {
 
     /// Send prompt to GPT model and get response with web search enabled
     /// history: previous (user, assistant) pairs in chronological order
-    pub async fn send_prompt(&self, prompt: &str, model: &str, history: &[crate::db::ConversationMessage]) -> Result<String, String> {
-        println!("🤖 Sending prompt to {} (history: {} messages)...", model, history.len());
+    pub async fn send_prompt(&self, prompt: &str, model: &str, history: &[crate::db::ConversationMessage], image_data: Option<&str>) -> Result<String, String> {
+        println!("🤖 Sending prompt to {} (history: {} messages, image: {})...", model, history.len(), image_data.is_some());
         println!("📝 Prompt: {}", prompt);
 
         // Map model names to their correct identifiers
@@ -179,10 +179,30 @@ impl OpenAIClient {
                 "content": msg.content
             })
         }).collect();
-        input.push(json!({
-            "role": "user",
-            "content": prompt
-        }));
+
+        // Build user message: multimodal if image attached, plain text otherwise
+        if let Some(img) = image_data {
+            let mut content = vec![
+                json!({"type": "input_text", "text": prompt})
+            ];
+            // Add image with data URI
+            let image_url = if img.starts_with("data:") {
+                img.to_string()
+            } else {
+                format!("data:image/png;base64,{}", img)
+            };
+            content.push(json!({"type": "input_image", "image_url": image_url}));
+            input.push(json!({
+                "role": "user",
+                "content": content
+            }));
+            println!("🖼️ Image attached ({} bytes base64)", img.len());
+        } else {
+            input.push(json!({
+                "role": "user",
+                "content": prompt
+            }));
+        }
 
         let body = json!({
             "model": api_model,

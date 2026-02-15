@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import { playStartSound, playStopSound, playCancelSound } from "./sounds";
+import { playStartSound, playStopSound, playCancelSound, playResponseSound } from "./sounds";
 
 interface TranscriptionEntry {
   text: string;
@@ -310,6 +310,12 @@ function App() {
       }
     });
 
+    // Listen for response-ready (play notification sound)
+    const unlistenResponse = listen("response-ready", () => {
+      console.log("🔔 Response ready, playing notification sound");
+      playResponseSound();
+    });
+
     return () => {
       unlistenHotkey.then((fn) => fn());
       unlistenWidgetStop.then((fn) => fn());
@@ -318,6 +324,7 @@ function App() {
       unlistenHistory.then((fn) => fn());
       unlistenDelta.then((fn) => fn());
       unlistenTranscription.then((fn) => fn());
+      unlistenResponse.then((fn) => fn());
     };
   }, []); // Empty deps - refs always have current values, no need to re-register
 
