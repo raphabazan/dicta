@@ -29,6 +29,7 @@ function App() {
   const [statsData, setStatsData] = useState<StatsData | null>(null);
   const [statsRange, setStatsRange] = useState<"today" | "7days" | "month" | "year" | "all">("month");
   const [showStatsDetails, setShowStatsDetails] = useState(false);
+  const [ttsEnabled, setTtsEnabled] = useState(false);
 
   // Refs to always have current values inside event listener closures
   const isRecordingRef = useRef(false);
@@ -219,6 +220,7 @@ function App() {
     // Load history and microphones on mount
     loadTranscriptionHistory();
     loadMicrophones();
+    invoke<boolean>("get_tts_enabled").then((v) => setTtsEnabled(v)).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -316,6 +318,12 @@ function App() {
       playResponseSound();
     });
 
+    // Listen for TTS toggle events (from Ctrl+Alt+S hotkey)
+    const unlistenTts = listen<boolean>("tts-toggled", (event) => {
+      console.log("🔊 TTS toggled:", event.payload);
+      setTtsEnabled(event.payload);
+    });
+
     return () => {
       unlistenHotkey.then((fn) => fn());
       unlistenWidgetStop.then((fn) => fn());
@@ -325,6 +333,7 @@ function App() {
       unlistenDelta.then((fn) => fn());
       unlistenTranscription.then((fn) => fn());
       unlistenResponse.then((fn) => fn());
+      unlistenTts.then((fn) => fn());
     };
   }, []); // Empty deps - refs always have current values, no need to re-register
 
@@ -442,6 +451,25 @@ function App() {
                     Realtime ⚡
                   </button>
                 </div>
+              </div>
+
+              {/* TTS Toggle */}
+              <div className="flex items-center justify-between border-b border-gray-700 pb-4">
+                <span className="text-sm text-gray-400">Text-to-Speech:</span>
+                <button
+                  onClick={async () => {
+                    const newVal = !ttsEnabled;
+                    setTtsEnabled(newVal);
+                    await invoke("set_tts_enabled", { enabled: newVal });
+                  }}
+                  className={`px-3 py-1 rounded text-xs transition-colors ${
+                    ttsEnabled
+                      ? "bg-green-600 text-white"
+                      : "bg-gray-700 text-gray-300 hover:bg-gray-600"
+                  }`}
+                >
+                  {ttsEnabled ? "ON" : "OFF"}
+                </button>
               </div>
 
               <div className="flex items-center justify-between">

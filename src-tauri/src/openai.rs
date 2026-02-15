@@ -280,6 +280,42 @@ impl OpenAIClient {
         Ok(response_text)
     }
 
+    /// Generate speech audio from text using OpenAI TTS API
+    pub async fn speak_text(&self, text: &str) -> Result<Vec<u8>, String> {
+        println!("🔊 Generating TTS for: {}...", &text[..text.len().min(80)]);
+
+        let body = json!({
+            "model": "tts-1",
+            "input": text,
+            "voice": "nova",
+            "response_format": "mp3"
+        });
+
+        let response = self
+            .client
+            .post("https://api.openai.com/v1/audio/speech")
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("TTS request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(format!("TTS API error ({}): {}", status, error_text));
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| format!("Failed to read TTS response: {}", e))?;
+
+        println!("✅ TTS audio received: {} bytes", bytes.len());
+        Ok(bytes.to_vec())
+    }
+
     fn audio_to_wav(&self, audio_data: Vec<f32>, sample_rate: u32) -> Result<Vec<u8>, String> {
         use std::io::Cursor;
 
