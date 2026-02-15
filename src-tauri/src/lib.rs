@@ -145,6 +145,116 @@ struct AppState {
     tts_enabled: Arc<Mutex<bool>>,
     tts_sink: Arc<Mutex<Option<rodio::Sink>>>,
     tts_stream_handle: Arc<Mutex<Option<rodio::OutputStreamHandle>>>,
+    tts_active: Arc<Mutex<bool>>,
+}
+
+/// Play TTS audio in chunks (sentence by sentence) with visual widget feedback.
+/// Each chunk is generated and played sequentially so audio starts fast.
+/// Can be cancelled by setting tts_active to false.
+async fn play_tts_chunked(
+    app: AppHandle,
+    text: String,
+    openai: Arc<openai::OpenAIClient>,
+    tts_sink: Arc<Mutex<Option<rodio::Sink>>>,
+    tts_stream_handle: Arc<Mutex<Option<rodio::OutputStreamHandle>>>,
+    tts_active: Arc<Mutex<bool>>,
+) {
+    // Set active flag
+    *tts_active.lock().unwrap() = true;
+
+    // Show TTS widget
+    if let Some(w) = app.get_webview_window("tts-widget") {
+        if let Ok(Some(monitor)) = app.primary_monitor() {
+            let screen = monitor.size();
+            let x = (screen.width as i32 - 100) / 2;
+            let y = screen.height as i32 - 32 - 120;
+            let _ = w.set_position(PhysicalPosition::new(x, y));
+        }
+        let _ = w.show();
+    }
+
+    let chunks = openai::split_into_tts_chunks(&text);
+    println!("🔊 TTS chunked playback: {} chunks", chunks.len());
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        // Check if cancelled
+        if !*tts_active.lock().unwrap() {
+            println!("🔇 TTS cancelled at chunk {}/{}", i + 1, chunks.len());
+            break;
+        }
+
+        println!("🔊 TTS chunk {}/{}: generating audio for {} chars...", i + 1, chunks.len(), chunk.len());
+
+        match openai.speak_text(chunk).await {
+            Ok(audio) => {
+                // Check again after API call
+                if !*tts_active.lock().unwrap() {
+                    println!("🔇 TTS cancelled after generating chunk {}", i + 1);
+                    break;
+                }
+
+                // Wait for previous chunk to finish playing
+                let needs_wait = {
+                    let sg = tts_sink.lock().unwrap();
+                    sg.as_ref().map(|s| !s.empty()).unwrap_or(false)
+                };
+                if needs_wait {
+                    loop {
+                        if !*tts_active.lock().unwrap() {
+                            println!("🔇 TTS cancelled while waiting for previous chunk");
+                            break;
+                        }
+                        let empty = {
+                            let sg = tts_sink.lock().unwrap();
+                            sg.as_ref().map(|s| s.empty()).unwrap_or(true)
+                        };
+                        if empty { break; }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    if !*tts_active.lock().unwrap() { break; }
+                }
+
+                // Stop previous sink and play new chunk
+                {
+                    let mut sg = tts_sink.lock().unwrap();
+                    if let Some(s) = sg.take() { s.stop(); }
+                }
+
+                let hg = tts_stream_handle.lock().unwrap();
+                if let Some(h) = hg.as_ref() {
+                    if let Ok(src) = rodio::Decoder::new(std::io::Cursor::new(audio)) {
+                        if let Ok(sink) = rodio::Sink::try_new(h) {
+                            sink.append(src);
+                            *tts_sink.lock().unwrap() = Some(sink);
+                            println!("🔊 TTS chunk {}/{} playing", i + 1, chunks.len());
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ TTS chunk {} failed: {}", i + 1, e);
+            }
+        }
+    }
+
+    // Wait for last chunk to finish
+    loop {
+        let still_active = *tts_active.lock().unwrap();
+        if !still_active { break; }
+        let empty = {
+            let sg = tts_sink.lock().unwrap();
+            sg.as_ref().map(|s| s.empty()).unwrap_or(true)
+        };
+        if empty { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Clean up
+    *tts_active.lock().unwrap() = false;
+    if let Some(w) = app.get_webview_window("tts-widget") {
+        let _ = w.hide();
+    }
+    println!("🔊 TTS chunked playback finished");
 }
 
 #[tauri::command]
@@ -189,6 +299,9 @@ async fn start_recording_audio(state: State<'_, AppState>, app: AppHandle) -> Re
     let recorder = state.audio_recorder.lock().unwrap();
     recorder.start_recording(selected_mic)?;
     *is_recording = true;
+
+    // Small delay so the frontend start-sound (150ms) finishes before muting
+    std::thread::sleep(Duration::from_millis(200));
 
     // Mute system audio while recording
     if let Err(e) = system_audio::mute_system_audio() {
@@ -337,6 +450,7 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
     let tts_enabled = state.tts_enabled.clone();
     let tts_sink = state.tts_sink.clone();
     let tts_stream_handle = state.tts_stream_handle.clone();
+    let tts_active = state.tts_active.clone();
     let openai_for_tts = state.openai_client.clone();
     tokio::spawn(async move {
         match openai.transcribe_audio(audio_data, 48000).await {
@@ -391,30 +505,13 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
                                 let _ = window.emit("response-ready", ());
                             }
 
-                            // TTS
+                            // TTS (chunked)
                             if *tts_enabled.lock().unwrap() {
-                                let openai_tts = openai_for_tts.clone();
-                                let tts_sink2 = tts_sink.clone();
-                                let tts_handle2 = tts_stream_handle.clone();
-                                let tts_text = gpt_response.clone();
-                                tokio::spawn(async move {
-                                    if let Ok(audio) = openai_tts.speak_text(&tts_text).await {
-                                        {
-                                            let mut sg = tts_sink2.lock().unwrap();
-                                            if let Some(s) = sg.take() { s.stop(); }
-                                        }
-                                        let hg = tts_handle2.lock().unwrap();
-                                        if let Some(h) = hg.as_ref() {
-                                            if let Ok(src) = rodio::Decoder::new(std::io::Cursor::new(audio)) {
-                                                if let Ok(sink) = rodio::Sink::try_new(h) {
-                                                    sink.append(src);
-                                                    *tts_sink2.lock().unwrap() = Some(sink);
-                                                    println!("🔊 TTS playback started");
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
+                                tauri::async_runtime::spawn(play_tts_chunked(
+                                    app_handle.clone(), gpt_response.clone(),
+                                    openai_for_tts.clone(), tts_sink.clone(),
+                                    tts_stream_handle.clone(), tts_active.clone(),
+                                ));
                             }
                         }
                         Err(e) => eprintln!("❌ GPT prompt error: {}", e),
@@ -457,28 +554,7 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
                         let _ = window.emit("response-ready", ());
                     }
 
-                    // TTS
-                    if *tts_enabled.lock().unwrap() {
-                        let openai_tts = openai_for_tts.clone();
-                        let tts_sink2 = tts_sink.clone();
-                        let tts_handle2 = tts_stream_handle.clone();
-                        let tts_text = transcribed_text.clone();
-                        tokio::spawn(async move {
-                            if let Ok(audio) = openai_tts.speak_text(&tts_text).await {
-                                let mut sg = tts_sink2.lock().unwrap();
-                                if let Some(s) = sg.take() { s.stop(); }
-                                let hg = tts_handle2.lock().unwrap();
-                                if let Some(h) = hg.as_ref() {
-                                    if let Ok(src) = rodio::Decoder::new(std::io::Cursor::new(audio)) {
-                                        if let Ok(sink) = rodio::Sink::try_new(h) {
-                                            sink.append(src);
-                                            *tts_sink2.lock().unwrap() = Some(sink);
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                    }
+                    // TTS skipped for transcribe-only (would just repeat what user said)
                 }
             }
             Err(e) => eprintln!("❌ Transcription error: {}", e),
@@ -646,6 +722,7 @@ async fn send_text_prompt(state: State<'_, AppState>, app: AppHandle, prompt: St
     let tts_enabled = state.tts_enabled.clone();
     let tts_sink = state.tts_sink.clone();
     let tts_stream_handle = state.tts_stream_handle.clone();
+    let tts_active = state.tts_active.clone();
     let openai_for_tts = state.openai_client.clone();
 
     // Load conversation history before spawning
@@ -687,25 +764,13 @@ async fn send_text_prompt(state: State<'_, AppState>, app: AppHandle, prompt: St
                     let _ = window.emit("response-ready", ());
                 }
 
-                // TTS
+                // TTS (chunked)
                 if *tts_enabled.lock().unwrap() {
-                    let tts_text = response.clone();
-                    if let Ok(audio) = openai_for_tts.speak_text(&tts_text).await {
-                        {
-                            let mut sg = tts_sink.lock().unwrap();
-                            if let Some(s) = sg.take() { s.stop(); }
-                        }
-                        let hg = tts_stream_handle.lock().unwrap();
-                        if let Some(h) = hg.as_ref() {
-                            if let Ok(src) = rodio::Decoder::new(std::io::Cursor::new(audio)) {
-                                if let Ok(sink) = rodio::Sink::try_new(h) {
-                                    sink.append(src);
-                                    *tts_sink.lock().unwrap() = Some(sink);
-                                    println!("🔊 TTS playback started");
-                                }
-                            }
-                        }
-                    }
+                    tauri::async_runtime::spawn(play_tts_chunked(
+                        app_handle.clone(), response.clone(),
+                        openai_for_tts.clone(), tts_sink.clone(),
+                        tts_stream_handle.clone(), tts_active.clone(),
+                    ));
                 }
             }
             Err(e) => {
@@ -726,6 +791,9 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
 
     println!("🎤 Starting realtime transcription...");
     *is_recording = true;
+
+    // Small delay so the frontend start-sound (150ms) finishes before muting
+    std::thread::sleep(Duration::from_millis(200));
 
     // Mute system audio while recording
     if let Err(e) = system_audio::mute_system_audio() {
@@ -1160,6 +1228,7 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
             let tts_enabled_rt = state.tts_enabled.clone();
             let tts_sink_rt = state.tts_sink.clone();
             let tts_handle_rt = state.tts_stream_handle.clone();
+            let tts_active_rt = state.tts_active.clone();
             let openai_tts_rt = state.openai_client.clone();
 
             tokio::spawn(async move {
@@ -1201,25 +1270,13 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
                             let _ = window.emit("response-ready", ());
                         }
 
-                        // TTS
+                        // TTS (chunked)
                         if *tts_enabled_rt.lock().unwrap() {
-                            let tts_text = gpt_response.clone();
-                            if let Ok(audio) = openai_tts_rt.speak_text(&tts_text).await {
-                                {
-                                    let mut sg = tts_sink_rt.lock().unwrap();
-                                    if let Some(s) = sg.take() { s.stop(); }
-                                }
-                                let hg = tts_handle_rt.lock().unwrap();
-                                if let Some(h) = hg.as_ref() {
-                                    if let Ok(src) = rodio::Decoder::new(std::io::Cursor::new(audio)) {
-                                        if let Ok(sink) = rodio::Sink::try_new(h) {
-                                            sink.append(src);
-                                            *tts_sink_rt.lock().unwrap() = Some(sink);
-                                            println!("🔊 TTS playback started");
-                                        }
-                                    }
-                                }
-                            }
+                            tauri::async_runtime::spawn(play_tts_chunked(
+                                app_clone.clone(), gpt_response.clone(),
+                                openai_tts_rt.clone(), tts_sink_rt.clone(),
+                                tts_handle_rt.clone(), tts_active_rt.clone(),
+                            ));
                         }
                     }
                     Err(e) => eprintln!("❌ GPT prompt error: {}", e),
@@ -1250,11 +1307,6 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
             let app_clone = app.clone();
             let text_clone = transcript.clone();
             let app_for_sound = app.clone();
-            let tts_enabled_nm = state.tts_enabled.clone();
-            let tts_sink_nm = state.tts_sink.clone();
-            let tts_handle_nm = state.tts_stream_handle.clone();
-            let openai_tts_nm = state.openai_client.clone();
-            let tts_text_nm = transcript.clone();
             std::thread::spawn(move || {
                 match auto_paste_text(&app_clone, &text_clone) {
                     Ok(_) => println!("✅ Session transcript auto-pasted"),
@@ -1266,27 +1318,7 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
                     let _ = window.emit("response-ready", ());
                 }
 
-                // TTS (spawn async task from sync thread via tauri runtime)
-                if *tts_enabled_nm.lock().unwrap() {
-                    tauri::async_runtime::spawn(async move {
-                        if let Ok(audio) = openai_tts_nm.speak_text(&tts_text_nm).await {
-                            {
-                                let mut sg = tts_sink_nm.lock().unwrap();
-                                if let Some(s) = sg.take() { s.stop(); }
-                            }
-                            let hg = tts_handle_nm.lock().unwrap();
-                            if let Some(h) = hg.as_ref() {
-                                if let Ok(src) = rodio::Decoder::new(std::io::Cursor::new(audio)) {
-                                    if let Ok(sink) = rodio::Sink::try_new(h) {
-                                        sink.append(src);
-                                        *tts_sink_nm.lock().unwrap() = Some(sink);
-                                        println!("🔊 TTS playback started");
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
+                // TTS skipped for transcribe-only (would just repeat what user said)
             });
         }
     }
@@ -1315,15 +1347,37 @@ fn set_tts_enabled(state: State<'_, AppState>, app: AppHandle, enabled: bool) ->
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.emit("tts-toggled", enabled);
     }
+    // Also notify recording widget
+    if let Some(widget) = app.get_webview_window("recording-widget") {
+        let _ = widget.emit("tts-toggled", enabled);
+    }
+    // Show toast
+    if let Some(toast) = app.get_webview_window("tts-toast") {
+        if let Ok(Some(monitor)) = app.primary_monitor() {
+            let screen = monitor.size();
+            let x = (screen.width as i32 - 140) / 2;
+            let y = screen.height as i32 - 40 - 300;
+            let _ = toast.set_position(PhysicalPosition::new(x, y));
+        }
+        let _ = toast.emit("tts-toast-show", enabled);
+        let _ = toast.show();
+    }
     Ok(())
 }
 
 #[tauri::command]
-fn stop_tts_playback(state: State<'_, AppState>) -> Result<(), String> {
+fn stop_tts_playback(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+    // Cancel chunked playback loop
+    *state.tts_active.lock().unwrap() = false;
+    // Stop current sink
     let mut sink_guard = state.tts_sink.lock().unwrap();
     if let Some(sink) = sink_guard.take() {
         sink.stop();
         println!("🔇 TTS playback stopped");
+    }
+    // Hide widget
+    if let Some(w) = app.get_webview_window("tts-widget") {
+        let _ = w.hide();
     }
     Ok(())
 }
@@ -1389,6 +1443,7 @@ pub fn run() {
         tts_enabled: Arc::new(Mutex::new(tts_default)),
         tts_sink: Arc::new(Mutex::new(None)),
         tts_stream_handle: Arc::new(Mutex::new(tts_stream_handle_val)),
+        tts_active: Arc::new(Mutex::new(false)),
     };
 
     // Debounce: prevent multiple triggers when keys are held down
@@ -1444,7 +1499,7 @@ pub fn run() {
                                         if let Ok(monitor) = widget.current_monitor() {
                                             if let Some(monitor) = monitor {
                                                 let screen_size = monitor.size();
-                                                let widget_width = 125;
+                                                let widget_width = 155;
                                                 let widget_height = 120; // Height increased for combo box
                                                 let bottom_margin = 200; // More space from taskbar
 
@@ -1499,7 +1554,7 @@ pub fn run() {
                                         if let Ok(monitor) = widget.current_monitor() {
                                             if let Some(monitor) = monitor {
                                                 let screen_size = monitor.size();
-                                                let widget_width = 125;
+                                                let widget_width = 155;
                                                 let widget_height = 120; // Height increased for combo box
                                                 let bottom_margin = 200; // More space from taskbar
 
@@ -1566,7 +1621,7 @@ pub fn run() {
                                         if let Ok(monitor) = widget.current_monitor() {
                                             if let Some(monitor) = monitor {
                                                 let screen_size = monitor.size();
-                                                let widget_width = 125;
+                                                let widget_width = 155;
                                                 let widget_height = 120; // Height increased for combo box
                                                 let bottom_margin = 200; // More space from taskbar
 
@@ -1630,50 +1685,55 @@ pub fn run() {
                             if let Some(window) = app.get_webview_window("main") {
                                 let _ = window.emit("tts-toggled", new_val);
                             }
+                            // Also emit to recording widget
+                            if let Some(widget) = app.get_webview_window("recording-widget") {
+                                let _ = widget.emit("tts-toggled", new_val);
+                            }
+                            // Show toast
+                            if let Some(toast) = app.get_webview_window("tts-toast") {
+                                if let Ok(Some(monitor)) = app.primary_monitor() {
+                                    let screen = monitor.size();
+                                    let x = (screen.width as i32 - 140) / 2;
+                                    let y = screen.height as i32 - 40 - 300;
+                                    let _ = toast.set_position(PhysicalPosition::new(x, y));
+                                }
+                                let _ = toast.emit("tts-toast-show", new_val);
+                                let _ = toast.show();
+                            }
                         }
                     } else if shortcut_str.contains("KeyS") && shortcut_str.contains("ALT") && shortcut_str.contains("SHIFT") {
                         // Alt+Shift+S: Stop TTS playback or read last message
                         tlog!("🔥 Hotkey pressed: Alt+Shift+S (TTS action)");
                         if let Some(state) = app.try_state::<AppState>() {
-                            // Check if something is playing
-                            let is_playing = {
-                                let sink_guard = state.tts_sink.lock().unwrap();
-                                sink_guard.as_ref().map(|s| !s.empty()).unwrap_or(false)
-                            };
+                            let is_active = *state.tts_active.lock().unwrap();
 
-                            if is_playing {
-                                // Stop current playback
-                                let mut sink_guard = state.tts_sink.lock().unwrap();
-                                if let Some(sink) = sink_guard.take() {
-                                    sink.stop();
-                                    println!("🔇 TTS playback stopped via Ctrl+S");
+                            if is_active {
+                                // Stop current chunked playback
+                                *state.tts_active.lock().unwrap() = false;
+                                {
+                                    let mut sink_guard = state.tts_sink.lock().unwrap();
+                                    if let Some(sink) = sink_guard.take() {
+                                        sink.stop();
+                                    }
                                 }
+                                if let Some(w) = app.get_webview_window("tts-widget") {
+                                    let _ = w.hide();
+                                }
+                                println!("🔇 TTS playback stopped via Alt+Shift+S");
                             } else {
-                                // Read last message aloud
+                                // Read last message aloud (chunked)
                                 let last_text = state.last_transcription.lock().unwrap().clone();
                                 if let Some(text) = last_text {
-                                    println!("🔊 Reading last message via TTS: {}...", &text[..text.len().min(50)]);
+                                    let preview: String = text.chars().take(50).collect();
+                                    println!("🔊 Reading last message via TTS: {}...", preview);
                                     let openai = state.openai_client.clone();
                                     let tts_sink = state.tts_sink.clone();
                                     let tts_handle = state.tts_stream_handle.clone();
-                                    tauri::async_runtime::spawn(async move {
-                                        if let Ok(audio) = openai.speak_text(&text).await {
-                                            {
-                                                let mut sg = tts_sink.lock().unwrap();
-                                                if let Some(s) = sg.take() { s.stop(); }
-                                            }
-                                            let hg = tts_handle.lock().unwrap();
-                                            if let Some(h) = hg.as_ref() {
-                                                if let Ok(src) = rodio::Decoder::new(std::io::Cursor::new(audio)) {
-                                                    if let Ok(sink) = rodio::Sink::try_new(h) {
-                                                        sink.append(src);
-                                                        *tts_sink.lock().unwrap() = Some(sink);
-                                                        println!("🔊 TTS playback started");
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    });
+                                    let tts_active = state.tts_active.clone();
+                                    let app_clone = app.clone();
+                                    tauri::async_runtime::spawn(play_tts_chunked(
+                                        app_clone, text, openai, tts_sink, tts_handle, tts_active,
+                                    ));
                                 } else {
                                     println!("⚠️ No message to read aloud");
                                 }

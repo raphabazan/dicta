@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TTS Toast</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 140px;
+      height: 40px;
+      overflow: hidden;
+      background: transparent;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+
+    body::-webkit-scrollbar {
+      display: none;
+    }
+    body {
+      -ms-overflow-style: none;
+      scrollbar-width: none;
+    }
+
+    .toast {
+      width: 140px;
+      height: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      background: rgba(17, 24, 39, 0.95);
+      border-radius: 20px;
+      padding: 0 16px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+      backdrop-filter: blur(8px);
+      animation: fadeInOut 1.5s ease-in-out;
+    }
+
+    .toast.tts-on {
+      border: 1px solid rgba(56, 189, 248, 0.6);
+    }
+
+    .toast.tts-off {
+      border: 1px solid rgba(107, 114, 128, 0.5);
+    }
+
+    @keyframes fadeInOut {
+      0% { opacity: 0; transform: translateY(8px); }
+      15% { opacity: 1; transform: translateY(0); }
+      75% { opacity: 1; transform: translateY(0); }
+      100% { opacity: 0; transform: translateY(-4px); }
+    }
+
+    .icon {
+      width: 20px;
+      height: 20px;
+      flex-shrink: 0;
+    }
+
+    .label {
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+    }
+
+    .tts-on .label {
+      color: rgba(56, 189, 248, 0.95);
+    }
+
+    .tts-off .label {
+      color: rgba(156, 163, 175, 0.9);
+    }
+
+    .tts-off .tts-waves {
+      display: none;
+    }
+
+    .tts-on .tts-slash {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="toast tts-off" id="toast">
+    <svg class="icon" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M11 5L6 9H2v6h4l5 4V5z" fill="currentColor"/>
+      <path class="tts-waves" d="M15.54 8.46a5 5 0 010 7.07" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      <path class="tts-slash" d="M3 21L21 3" stroke="#ef4444" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+    <span class="label" id="label">TTS OFF</span>
+  </div>
+
+  <script type="module">
+    import { listen } from '@tauri-apps/api/event';
+    import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+
+    const currentWindow = getCurrentWebviewWindow();
+    const toast = document.getElementById('toast');
+    const label = document.getElementById('label');
+    let hideTimeout = null;
+
+    listen('tts-toast-show', (event) => {
+      const enabled = event.payload;
+
+      // Update visuals
+      if (enabled) {
+        toast.className = 'toast tts-on';
+        toast.style.color = 'rgba(56, 189, 248, 0.95)';
+        label.textContent = 'TTS ON';
+      } else {
+        toast.className = 'toast tts-off';
+        toast.style.color = 'rgba(156, 163, 175, 0.9)';
+        label.textContent = 'TTS OFF';
+      }
+
+      // Reset animation
+      toast.style.animation = 'none';
+      toast.offsetHeight; // Force reflow
+      toast.style.animation = 'fadeInOut 1.5s ease-in-out';
+
+      // Auto-hide after 1.5s
+      if (hideTimeout) clearTimeout(hideTimeout);
+      hideTimeout = setTimeout(() => {
+        currentWindow.hide();
+      }, 1500);
+    });
+  </script>
+</body>
+</html>

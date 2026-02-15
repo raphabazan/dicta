@@ -12,7 +12,7 @@
     }
 
     body {
-      width: 125px;
+      width: 155px;
       height: 120px;
       overflow: hidden; /* Remove scrollbars */
       background: transparent;
@@ -32,15 +32,15 @@
       position: absolute;
       bottom: 0;
       left: 0;
-      width: 125px;
+      width: 155px;
       height: 40px;
       display: flex;
       align-items: center;
-      justify-content: space-between;
+      justify-content: space-evenly;
       background: rgba(17, 24, 39, 0.95);
       border: 1px solid rgba(239, 68, 68, 0.5);
       border-radius: 20px;
-      padding: 0 8px;
+      padding: 0 6px;
       box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
       backdrop-filter: blur(8px);
       cursor: move;
@@ -48,8 +48,8 @@
     }
 
     .drag-area {
-      flex: 1;
-      height: 100%;
+      width: 24px;
+      height: 24px;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -94,6 +94,32 @@
       background: rgba(107, 114, 128, 0.5);
     }
 
+    .btn-tts {
+      background: transparent;
+      position: relative;
+    }
+
+    .btn-tts:hover {
+      background: rgba(107, 114, 128, 0.3);
+    }
+
+    .btn-tts svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    .btn-tts .tts-slash {
+      display: none;
+    }
+
+    .btn-tts.tts-off .tts-slash {
+      display: block;
+    }
+
+    .btn-tts.tts-off .tts-waves {
+      display: none;
+    }
+
     .btn-stop {
       background: #ef4444;
     }
@@ -119,7 +145,7 @@
       position: absolute;
       top: -110px;
       left: 0;
-      width: 125px;
+      width: 155px;
       background: rgba(17, 24, 39, 0.95);
       border: 1px solid rgba(239, 68, 68, 0.3);
       border-radius: 8px;
@@ -187,6 +213,13 @@
     <div class="drag-area" id="dragArea" data-tauri-drag-region>
       <div class="indicator"></div>
     </div>
+    <button class="btn btn-tts tts-off" id="ttsBtn" title="Toggle TTS">
+      <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M11 5L6 9H2v6h4l5 4V5z" fill="rgba(56, 189, 248, 0.9)"/>
+        <path class="tts-waves" d="M15.54 8.46a5 5 0 010 7.07" stroke="rgba(56, 189, 248, 0.9)" stroke-width="1.5" stroke-linecap="round"/>
+        <path class="tts-slash" d="M3 21L21 3" stroke="#ef4444" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+    </button>
     <button class="btn btn-stop" id="stopBtn" title="Stop & Send">
       <div class="icon-stop"></div>
     </button>
@@ -199,16 +232,51 @@
 
     const cancelBtn = document.getElementById('cancelBtn');
     const stopBtn = document.getElementById('stopBtn');
+    const ttsBtn = document.getElementById('ttsBtn');
     const dragArea = document.getElementById('dragArea');
     const widget = document.getElementById('widget');
     const currentWindow = getCurrentWebviewWindow();
     const modelOptions = document.querySelectorAll('.model-option');
 
+    // TTS state
+    let ttsEnabled = false;
+
+    function updateTtsIcon(enabled) {
+      ttsEnabled = enabled;
+      if (enabled) {
+        ttsBtn.classList.remove('tts-off');
+        ttsBtn.title = 'TTS ON (click to disable)';
+      } else {
+        ttsBtn.classList.add('tts-off');
+        ttsBtn.title = 'TTS OFF (click to enable)';
+      }
+    }
+
+    // Load TTS state on start
+    invoke('get_tts_enabled').then(val => updateTtsIcon(val)).catch(() => {});
+
+    // Listen for TTS toggle events (from Ctrl+Alt+S or other sources)
+    listen('tts-toggled', (event) => {
+      updateTtsIcon(event.payload);
+    });
+
+    // TTS toggle on click
+    ttsBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      try {
+        const newVal = !ttsEnabled;
+        await invoke('set_tts_enabled', { enabled: newVal });
+        updateTtsIcon(newVal);
+      } catch (error) {
+        console.error('Failed to toggle TTS:', error);
+      }
+    });
+
     // Load and set active model from database
     async function loadSelectedModel() {
       try {
         const model = await invoke('get_selected_prompt_model') || 'transcribe-only';
-        console.log('📋 Loading model from database:', model);
+        console.log('Loading model from database:', model);
         modelOptions.forEach(opt => {
           opt.classList.toggle('active', opt.dataset.model === model);
         });
@@ -223,24 +291,20 @@
     function showForceHover() {
       loadSelectedModel();
       widget.classList.add('force-hover');
-      console.log('🎯 Forcing hover display for 2 seconds');
       if (forceHoverTimeout) clearTimeout(forceHoverTimeout);
       forceHoverTimeout = setTimeout(() => {
         widget.classList.remove('force-hover');
-        console.log('✅ Hover display timeout ended');
       }, 2000);
     }
 
     // Trigger on window focus (when Tauri calls window.show())
     window.addEventListener('focus', () => {
-      console.log('🪟 Widget window focused - showing hover');
       showForceHover();
     });
 
     // Also trigger on visibilitychange
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
-        console.log('👁️ Widget became visible - showing hover');
         showForceHover();
       }
     });
@@ -250,18 +314,12 @@
       option.addEventListener('click', async (e) => {
         e.stopPropagation(); // Prevent dragging
         const model = option.dataset.model;
-        console.log('🔄 User clicked on model:', model);
         try {
           await invoke('set_selected_prompt_model', { model, saveAsDefault: true });
           modelOptions.forEach(opt => opt.classList.remove('active'));
           option.classList.add('active');
-          console.log('✅ Model saved to database:', model);
-
-          // Verify it was saved
-          const verification = await invoke('get_selected_prompt_model');
-          console.log('🔍 Verification - model in DB is now:', verification);
         } catch (error) {
-          console.error('❌ Failed to save model:', error);
+          console.error('Failed to save model:', error);
         }
       });
     });
@@ -272,15 +330,11 @@
     // Listen for model-selected event from backend (sent when recording starts)
     listen('model-selected', (event) => {
       const model = event.payload;
-      console.log('📡 Backend sent model-selected event:', model);
       modelOptions.forEach(opt => {
         opt.classList.toggle('active', opt.dataset.model === model);
       });
-      // Also show force-hover so user sees the selection
       showForceHover();
     });
-
-    // Dragging is now handled by data-tauri-drag-region attribute
 
     cancelBtn.addEventListener('click', async () => {
       try {

@@ -375,3 +375,69 @@ impl OpenAIClient {
         output
     }
 }
+
+/// Split text into chunks at sentence boundaries for chunked TTS playback.
+/// Groups short sentences together (target ~200 chars, max ~400).
+pub fn split_into_tts_chunks(text: &str) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return vec![];
+    }
+
+    // Split at sentence-ending punctuation followed by space or end
+    let mut sentences: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+
+    for i in 0..len {
+        current.push(chars[i]);
+        let is_sentence_end = (chars[i] == '.' || chars[i] == '!' || chars[i] == '?')
+            && (i + 1 >= len || chars[i + 1] == ' ' || chars[i + 1] == '\n');
+
+        if is_sentence_end {
+            let trimmed = current.trim().to_string();
+            if !trimmed.is_empty() {
+                sentences.push(trimmed);
+            }
+            current.clear();
+        }
+    }
+    // Remaining text (no final punctuation)
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        sentences.push(trimmed);
+    }
+
+    // Group sentences into chunks (~200 chars target, ~400 max)
+    let mut chunks: Vec<String> = Vec::new();
+    let mut chunk = String::new();
+
+    for sentence in sentences {
+        if chunk.is_empty() {
+            chunk = sentence;
+        } else if chunk.len() + sentence.len() + 1 <= 400 {
+            chunk.push(' ');
+            chunk.push_str(&sentence);
+        } else {
+            chunks.push(chunk);
+            chunk = sentence;
+        }
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+
+    // If no sentences were found (no punctuation), just return the whole text
+    if chunks.is_empty() {
+        chunks.push(text.to_string());
+    }
+
+    println!("📝 TTS chunks: {} chunks from {} chars", chunks.len(), text.len());
+    for (i, c) in chunks.iter().enumerate() {
+        println!("  Chunk {}: {} chars", i + 1, c.len());
+    }
+
+    chunks
+}
