@@ -713,7 +713,7 @@ fn estimate_cost_cents(model: &str, duration_ms: Option<i64>, text: &str) -> i64
 
 #[tauri::command]
 async fn send_text_prompt(state: State<'_, AppState>, app: AppHandle, prompt: String, model: String, image_data: Option<String>) -> Result<(), String> {
-    println!("{} 🤖 send_text_prompt called - model: {}, image: {}, prompt: {}", ts(), model, image_data.is_some(), &prompt[..prompt.len().min(80)]);
+    println!("{} 🤖 send_text_prompt called - model: {}, image: {}, prompt: {}", ts(), model, image_data.is_some(), prompt.chars().take(80).collect::<String>());
 
     let openai = state.openai_client.clone();
     let database = state.database.clone();
@@ -731,7 +731,7 @@ async fn send_text_prompt(state: State<'_, AppState>, app: AppHandle, prompt: St
     tokio::spawn(async move {
         match openai.send_prompt(&prompt, &model, &conv_history, image_data.as_deref()).await {
             Ok(response) => {
-                println!("{} ✅ Text prompt response: {}", ts(), &response[..response.len().min(80)]);
+                println!("{} ✅ Text prompt response: {}", ts(), response.chars().take(80).collect::<String>());
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()

@@ -282,7 +282,8 @@ impl OpenAIClient {
 
     /// Generate speech audio from text using OpenAI TTS API
     pub async fn speak_text(&self, text: &str) -> Result<Vec<u8>, String> {
-        println!("🔊 Generating TTS for: {}...", &text[..text.len().min(80)]);
+        let preview: String = text.chars().take(80).collect();
+        println!("🔊 Generating TTS for: {}...", preview);
 
         let body = json!({
             "model": "tts-1",
