@@ -65,7 +65,24 @@ pub struct AudioRecorder {
 pub struct StreamingAudioRecorder {
     recording: Arc<Mutex<bool>>,
     chunk_sender: Option<mpsc::UnboundedSender<Vec<i16>>>,
-    stream: Option<cpal::Stream>, // Keep stream alive, drop when done
+    stream: Option<cpal::Stream>,
+}
+
+/// Handle that signals the audio thread to stop.
+/// The audio thread uses try_recv with a 10ms poll, so it checks
+/// the recording flag frequently and exits promptly.
+#[derive(Clone)]
+pub struct StreamingStopHandle {
+    recording: Arc<Mutex<bool>>,
+}
+
+impl StreamingStopHandle {
+    /// Signal the audio thread to stop. It will exit within ~10ms
+    /// and drop the cpal::Stream, releasing the microphone.
+    pub fn stop(&self) {
+        *self.recording.lock().unwrap() = false;
+        println!("🔌 Stop signal sent to audio thread");
+    }
 }
 
 impl AudioRecorder {
@@ -279,6 +296,13 @@ impl StreamingAudioRecorder {
             recording: Arc::new(Mutex::new(false)),
             chunk_sender: None,
             stream: None,
+        }
+    }
+
+    /// Get a stop handle that can be sent to other threads
+    pub fn stop_handle(&self) -> StreamingStopHandle {
+        StreamingStopHandle {
+            recording: self.recording.clone(),
         }
     }
 

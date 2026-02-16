@@ -149,6 +149,7 @@ struct AppState {
     tts_stream_handle: Arc<Mutex<Option<rodio::OutputStreamHandle>>>,
     tts_active: Arc<Mutex<bool>>,
     queue_dir: PathBuf,
+    streaming_stop_handle: Arc<Mutex<Option<audio::StreamingStopHandle>>>,
 }
 
 /// Strip markdown links, citations, and raw URLs from text for TTS playback.
@@ -965,6 +966,7 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
     let app_handle = app.clone();
     let queue_dir_for_spawn = state.queue_dir.clone();
     let database_for_spawn = state.database.clone();
+    let stop_handle_state = state.streaming_stop_handle.clone();
 
     tokio::spawn(async move {
         match realtime_client.connect().await {
@@ -998,6 +1000,8 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
 
                 println!("🔍 DEBUG: selected_mic_for_thread = {:?}", selected_mic_for_thread);
 
+                let stop_handle_state_for_thread = stop_handle_state.clone();
+
                 std::thread::spawn(move || {
                     println!("🔍 DEBUG: Inside thread, selected_mic = {:?}", selected_mic_for_thread);
                     let mut streaming_recorder = audio::StreamingAudioRecorder::new();
@@ -1012,20 +1016,34 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
                         }
                     };
 
+                    // Store stop handle so microphone can be released from outside
+                    *stop_handle_state_for_thread.lock().unwrap() = Some(streaming_recorder.stop_handle());
+
                     // Forward audio chunks to the async channel + accumulate locally
-                    while let Some(chunk) = local_audio_rx.blocking_recv() {
-                        // Check if we should stop
+                    // Use timeout-based recv so the thread can check the stop flag promptly
+                    loop {
                         if !*is_recording_for_audio.lock().unwrap() {
                             println!("🛑 Audio thread detected stop signal");
                             break;
                         }
 
-                        // Accumulate in local buffer for crash recovery
-                        buffer_for_audio_thread.lock().unwrap().extend_from_slice(&chunk);
-
-                        if audio_tx.send(chunk).is_err() {
-                            println!("🛑 Audio receiver closed");
-                            break;
+                        // Try to receive with a short timeout so we can re-check the stop flag
+                        match local_audio_rx.try_recv() {
+                            Ok(chunk) => {
+                                buffer_for_audio_thread.lock().unwrap().extend_from_slice(&chunk);
+                                if audio_tx.send(chunk).is_err() {
+                                    println!("🛑 Audio receiver closed");
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                                // No data yet, sleep briefly and retry
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                println!("🛑 Audio channel disconnected");
+                                break;
+                            }
                         }
                     }
 
@@ -1358,6 +1376,11 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
         *is_recording = false;
         println!("✅ is_recording is now false");
     } // Drop lock before await
+
+    // Immediately release the microphone (don't wait for audio thread to notice)
+    if let Some(handle) = state.streaming_stop_handle.lock().unwrap().take() {
+        handle.stop();
+    }
 
     // Restore system audio
     if let Err(e) = system_audio::unmute_system_audio() {
@@ -1839,19 +1862,44 @@ async fn process_retry_queue(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Load .env file
-    dotenv::dotenv().ok();
+    // Resolve app data directory (stable across launch methods)
+    let app_data_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::env::current_dir().expect("Failed to get current directory"))
+        .join("com.dicta.app");
+    std::fs::create_dir_all(&app_data_dir).ok();
+
+    // Load .env file: try app data dir first, then current dir (for dev mode)
+    let env_path = app_data_dir.join(".env");
+    if env_path.exists() {
+        dotenv::from_path(&env_path).ok();
+    } else {
+        dotenv::dotenv().ok();
+    }
 
     // Load OpenAI API key from environment
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .expect("OPENAI_API_KEY must be set in .env file");
+    let api_key = match std::env::var("OPENAI_API_KEY") {
+        Ok(key) => key,
+        Err(_) => {
+            eprintln!("❌ OPENAI_API_KEY not found. Place a .env file in: {}", app_data_dir.display());
+            // Show a native error dialog since there's no console in release mode
+            #[cfg(not(debug_assertions))]
+            {
+                use std::process::Command;
+                let msg = format!(
+                    "OPENAI_API_KEY não encontrada.\n\nCrie um arquivo .env com sua chave em:\n{}\n\nConteúdo do arquivo:\nOPENAI_API_KEY=sk-...",
+                    app_data_dir.display()
+                );
+                let _ = Command::new("powershell")
+                    .args(["-Command", &format!("Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show('{}', 'Dicta - Erro', 'OK', 'Error')", msg.replace('\'', "''"))])
+                    .output();
+            }
+            std::process::exit(1);
+        }
+    };
 
-    // Initialize database - get app data directory
-    let db_path = std::env::current_dir()
-        .expect("Failed to get current directory")
-        .join("dicta.db");
-
-    println!("📁 Database will be created at: {}", db_path.display());
+    // Initialize database in app data directory
+    let db_path = app_data_dir.join("dicta.db");
+    println!("📁 Database: {}", db_path.display());
 
     let database = Arc::new(
         db::Database::new(db_path)
@@ -1879,11 +1927,8 @@ pub fn run() {
         }
     };
 
-    // Initialize queue directory (in app data, not project dir, to avoid triggering dev hot-reload)
-    let queue_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| std::env::current_dir().expect("Failed to get current directory"))
-        .join("com.dicta.app")
-        .join("queue");
+    // Initialize queue directory
+    let queue_dir = app_data_dir.join("queue");
     std::fs::create_dir_all(&queue_dir).ok();
     println!("📁 Queue directory: {}", queue_dir.display());
 
@@ -1908,6 +1953,7 @@ pub fn run() {
         tts_stream_handle: Arc::new(Mutex::new(tts_stream_handle_val)),
         tts_active: Arc::new(Mutex::new(false)),
         queue_dir,
+        streaming_stop_handle: Arc::new(Mutex::new(None)),
     };
 
     // Debounce: prevent multiple triggers when keys are held down
@@ -2348,30 +2394,21 @@ pub fn run() {
             // Clear any stale mute from a previous crash
             let _ = system_audio::unmute_system_audio();
 
-            // Register global hotkeys
-            let shortcut_record = Shortcut::new(Some(Modifiers::CONTROL), Code::Space);
-            app.global_shortcut().register(shortcut_record).unwrap();
-
-            let shortcut_prompt_mini = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
-            app.global_shortcut().register(shortcut_prompt_mini).unwrap();
-
-            let shortcut_prompt_full = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Space);
-            app.global_shortcut().register(shortcut_prompt_full).unwrap();
-
-            let shortcut_paste = Shortcut::new(
-                Some(Modifiers::ALT | Modifiers::SHIFT),
-                Code::KeyZ
-            );
-            app.global_shortcut().register(shortcut_paste).unwrap();
-
-            let shortcut_prompt_input = Shortcut::new(Some(Modifiers::CONTROL), Code::KeyB);
-            app.global_shortcut().register(shortcut_prompt_input).unwrap();
-
-            let shortcut_tts_toggle = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyS);
-            app.global_shortcut().register(shortcut_tts_toggle).unwrap();
-
-            let shortcut_tts_action = Shortcut::new(Some(Modifiers::ALT | Modifiers::SHIFT), Code::KeyS);
-            app.global_shortcut().register(shortcut_tts_action).unwrap();
+            // Register global hotkeys (use .ok() to avoid crash if shortcut is already taken)
+            let shortcuts = [
+                Shortcut::new(Some(Modifiers::CONTROL), Code::Space),
+                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space),
+                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Space),
+                Shortcut::new(Some(Modifiers::ALT | Modifiers::SHIFT), Code::KeyZ),
+                Shortcut::new(Some(Modifiers::CONTROL), Code::KeyB),
+                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyS),
+                Shortcut::new(Some(Modifiers::ALT | Modifiers::SHIFT), Code::KeyS),
+            ];
+            for shortcut in &shortcuts {
+                if let Err(e) = app.global_shortcut().register(*shortcut) {
+                    eprintln!("⚠️ Failed to register shortcut {:?}: {}", shortcut, e);
+                }
+            }
 
             // Start background queue retry loop (every 30 seconds)
             {
