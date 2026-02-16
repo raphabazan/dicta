@@ -151,6 +151,74 @@ struct AppState {
     queue_dir: PathBuf,
 }
 
+/// Strip markdown links, citations, and raw URLs from text for TTS playback.
+fn strip_links_for_tts(text: &str) -> String {
+    // 1. Markdown links [text](url) → text
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '[' {
+            let mut link_text = String::new();
+            let mut found_close = false;
+            for inner in chars.by_ref() {
+                if inner == ']' { found_close = true; break; }
+                link_text.push(inner);
+            }
+            if found_close && chars.peek() == Some(&'(') {
+                chars.next(); // skip '('
+                let mut depth = 1;
+                for inner in chars.by_ref() {
+                    if inner == '(' { depth += 1; }
+                    if inner == ')' { depth -= 1; if depth == 0 { break; } }
+                }
+                // Only keep link text if it doesn't look like a domain
+                if !looks_like_url(&link_text) {
+                    result.push_str(&link_text);
+                }
+            } else {
+                result.push('[');
+                result.push_str(&link_text);
+                if found_close { result.push(']'); }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    // 2. Remove parenthesized content that looks like URLs/domains: (domain.com), (https://...)
+    let mut clean = String::with_capacity(result.len());
+    let mut i = 0;
+    while i < result.len() {
+        if result.as_bytes()[i] == b'(' {
+            let start = i + 1;
+            if let Some(end) = result[start..].find(')') {
+                let inner = result[start..start + end].trim();
+                if looks_like_url(inner) {
+                    i = start + end + 1;
+                    continue;
+                }
+            }
+        }
+        clean.push(result.as_bytes()[i] as char);
+        i += 1;
+    }
+    // 3. Remove remaining raw URLs
+    clean.split_whitespace()
+        .filter(|w| !looks_like_url(w))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Check if a string looks like a URL or domain name
+fn looks_like_url(s: &str) -> bool {
+    let s = s.trim_matches(|c: char| c == '(' || c == ')' || c == '[' || c == ']');
+    if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("www.") {
+        return true;
+    }
+    // Match domain patterns like "site.com", "site.com.br", "site.org/path"
+    let tlds = [".com", ".org", ".net", ".br", ".io", ".dev", ".gov", ".edu", ".info", ".co"];
+    tlds.iter().any(|tld| s.contains(tld))
+}
+
 /// Play TTS audio in chunks (sentence by sentence) with visual widget feedback.
 /// Each chunk is generated and played sequentially so audio starts fast.
 /// Can be cancelled by setting tts_active to false.
@@ -176,7 +244,9 @@ async fn play_tts_chunked(
         let _ = w.show();
     }
 
-    let chunks = openai::split_into_tts_chunks(&text);
+    // Strip markdown links and raw URLs so TTS doesn't read them
+    let clean_text = strip_links_for_tts(&text);
+    let chunks = openai::split_into_tts_chunks(&clean_text);
     println!("🔊 TTS chunked playback: {} chunks", chunks.len());
 
     for (i, chunk) in chunks.iter().enumerate() {

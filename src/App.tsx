@@ -36,8 +36,6 @@ function App() {
   const [transcriptionHistory, setTranscriptionHistory] = useState<TranscriptionEntry[]>([]);
   const [useRealtimeAPI, setUseRealtimeAPI] = useState(true); // Toggle between Whisper and Realtime
   const [currentTranscript, setCurrentTranscript] = useState(""); // Real-time transcript display
-  const [isStarting, setIsStarting] = useState(false); // Prevent duplicate start calls
-  const [isStopping, setIsStopping] = useState(false); // Prevent duplicate stop calls
   const [statsData, setStatsData] = useState<StatsData | null>(null);
   const [statsRange, setStatsRange] = useState<"today" | "7days" | "month" | "year" | "all">("month");
   const [showStatsDetails, setShowStatsDetails] = useState(false);
@@ -63,7 +61,6 @@ function App() {
 
     try {
       isStartingRef.current = true;
-      setIsStarting(true);
       setCurrentTranscript(""); // Reset transcript
 
       // Play start sound and wait for it to finish before backend mutes system audio
@@ -91,7 +88,6 @@ function App() {
       isRecordingRef.current = false;
     } finally {
       isStartingRef.current = false;
-      setTimeout(() => setIsStarting(false), 300);
     }
   };
 
@@ -105,7 +101,6 @@ function App() {
 
     try {
       isStoppingRef.current = true;
-      setIsStopping(true);
       setStatus("⏳ Processing...");
 
       // Play stop sound
@@ -138,7 +133,6 @@ function App() {
       setIsRecording(false);
     } finally {
       isStoppingRef.current = false;
-      setIsStopping(false);
     }
   };
 
@@ -397,8 +391,6 @@ function App() {
       isStartingRef.current = false;
       isStoppingRef.current = false;
       setIsRecording(false);
-      setIsStarting(false);
-      setIsStopping(false);
       setStatus(`Erro: ${event.payload}`);
       setCurrentTranscript("");
       playCancelSound();
