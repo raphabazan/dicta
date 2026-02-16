@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { playStartSound, playStopSound, playCancelSound, playResponseSound } from "./sounds";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 
 interface TranscriptionEntry {
   text: string;
@@ -15,10 +17,20 @@ interface StatsData {
   total_cost_cents: number;
 }
 
+interface PendingQueueItem {
+  id: number;
+  mode: string;
+  audio_path: string | null;
+  prompt_text: string | null;
+  model: string;
+  created_at: number;
+  retry_count: number;
+}
+
 function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [status, setStatus] = useState("Ready");
-  const [currentView, setCurrentView] = useState<"home" | "history" | "stats" | "settings">("home");
+  const [currentView, setCurrentView] = useState<"home" | "history" | "queue" | "stats" | "settings">("home");
   const [availableMicrophones, setAvailableMicrophones] = useState<string[]>([]);
   const [selectedMicrophone, setSelectedMicrophone] = useState<string>("");
   const [transcriptionHistory, setTranscriptionHistory] = useState<TranscriptionEntry[]>([]);
@@ -30,6 +42,13 @@ function App() {
   const [statsRange, setStatsRange] = useState<"today" | "7days" | "month" | "year" | "all">("month");
   const [showStatsDetails, setShowStatsDetails] = useState(false);
   const [ttsEnabled, setTtsEnabled] = useState(false);
+  const [queueCount, setQueueCount] = useState(0);
+  const [queueRetrying, setQueueRetrying] = useState(false);
+  const [queueItems, setQueueItems] = useState<PendingQueueItem[]>([]);
+  const [updateAvailable, setUpdateAvailable] = useState(false);
+  const [updateVersion, setUpdateVersion] = useState("");
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState("");
 
   // Refs to always have current values inside event listener closures
   const isRecordingRef = useRef(false);
@@ -47,8 +66,9 @@ function App() {
       setIsStarting(true);
       setCurrentTranscript(""); // Reset transcript
 
-      // Play start sound
+      // Play start sound and wait for it to finish before backend mutes system audio
       playStartSound();
+      await new Promise(resolve => setTimeout(resolve, 200));
 
       // Query backend for current mode (source of truth)
       const useRealtime = await invoke<boolean>("get_use_realtime");
@@ -128,6 +148,16 @@ function App() {
       setTranscriptionHistory(history); // Already ordered by backend (most recent first)
     } catch (error) {
       console.error("Failed to load history:", error);
+    }
+  };
+
+  const loadQueueItems = async () => {
+    try {
+      const items = await invoke<PendingQueueItem[]>("get_queue_items");
+      setQueueItems(items);
+      setQueueCount(items.length);
+    } catch (error) {
+      console.error("Failed to load queue items:", error);
     }
   };
 
@@ -214,6 +244,9 @@ function App() {
     if (currentView === "stats") {
       loadStats(statsRange);
     }
+    if (currentView === "queue") {
+      loadQueueItems();
+    }
   }, [currentView, statsRange]);
 
   useEffect(() => {
@@ -221,6 +254,19 @@ function App() {
     loadTranscriptionHistory();
     loadMicrophones();
     invoke<boolean>("get_tts_enabled").then((v) => setTtsEnabled(v)).catch(() => {});
+    invoke<number>("get_queue_count").then((v) => setQueueCount(v)).catch(() => {});
+
+    // Check for updates
+    check().then((update) => {
+      if (update?.available) {
+        setUpdateAvailable(true);
+        setUpdateVersion(update.version);
+        console.log("🔄 Update available:", update.version);
+      }
+    }).catch((e) => {
+      // Don't block app if update check fails (offline, etc.)
+      console.log("Update check skipped:", e);
+    });
   }, []);
 
   useEffect(() => {
@@ -324,6 +370,41 @@ function App() {
       setTtsEnabled(event.payload);
     });
 
+    // Listen for queue events
+    const unlistenQueueUpdated = listen<number>("queue-updated", (event) => {
+      console.log("📋 Queue updated:", event.payload);
+      setQueueCount(event.payload);
+      invoke<PendingQueueItem[]>("get_queue_items")
+        .then(items => setQueueItems(items))
+        .catch(() => {});
+    });
+
+    const unlistenQueueFull = listen("queue-full", () => {
+      console.log("⚠️ Queue full");
+      setStatus("Fila offline cheia (max 3)");
+      setTimeout(() => setStatus("Ready"), 3000);
+    });
+
+    const unlistenQueueCompleted = listen("queue-item-completed", () => {
+      console.log("✅ Queue item completed");
+      invoke<number>("get_queue_count").then((v) => setQueueCount(v)).catch(() => {});
+    });
+
+    // Listen for recording errors (connection drops, API failures)
+    const unlistenRecordingError = listen<string>("recording-error", (event) => {
+      console.error("❌ Recording error:", event.payload);
+      isRecordingRef.current = false;
+      isStartingRef.current = false;
+      isStoppingRef.current = false;
+      setIsRecording(false);
+      setIsStarting(false);
+      setIsStopping(false);
+      setStatus(`Erro: ${event.payload}`);
+      setCurrentTranscript("");
+      playCancelSound();
+      setTimeout(() => setStatus("Ready"), 5000);
+    });
+
     return () => {
       unlistenHotkey.then((fn) => fn());
       unlistenWidgetStop.then((fn) => fn());
@@ -334,6 +415,10 @@ function App() {
       unlistenTranscription.then((fn) => fn());
       unlistenResponse.then((fn) => fn());
       unlistenTts.then((fn) => fn());
+      unlistenQueueUpdated.then((fn) => fn());
+      unlistenQueueFull.then((fn) => fn());
+      unlistenQueueCompleted.then((fn) => fn());
+      unlistenRecordingError.then((fn) => fn());
     };
   }, []); // Empty deps - refs always have current values, no need to re-register
 
@@ -363,8 +448,58 @@ function App() {
     }
   };
 
+  const applyUpdate = async () => {
+    setIsUpdating(true);
+    setUpdateProgress("Baixando...");
+    try {
+      const update = await check();
+      if (update?.available) {
+        await update.downloadAndInstall((event) => {
+          if (event.event === "Started" && event.data.contentLength) {
+            setUpdateProgress(`Baixando... (${Math.round(event.data.contentLength / 1024)}KB)`);
+          } else if (event.event === "Finished") {
+            setUpdateProgress("Instalando...");
+          }
+        });
+        await relaunch();
+      }
+    } catch (e) {
+      console.error("Update failed:", e);
+      setUpdateProgress("Falha na atualização. Tente novamente.");
+      setIsUpdating(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-center p-8">
+      {/* Update Required Overlay */}
+      {updateAvailable && (
+        <div className="fixed inset-0 z-50 bg-black/90 flex flex-col items-center justify-center">
+          <div className="text-center space-y-6 max-w-md">
+            <h2 className="text-3xl font-bold">Atualização Disponível</h2>
+            <p className="text-gray-300">
+              Versão <span className="text-blue-400 font-semibold">{updateVersion}</span> está disponível.
+              Você precisa atualizar para continuar usando o Dicta.
+            </p>
+            {isUpdating ? (
+              <div className="space-y-2">
+                <div className="w-48 h-2 bg-gray-700 rounded-full mx-auto overflow-hidden">
+                  <div className="h-full bg-blue-500 rounded-full animate-pulse" style={{ width: "60%" }}></div>
+                </div>
+                <p className="text-sm text-gray-400">{updateProgress}</p>
+              </div>
+            ) : (
+              <button
+                onClick={applyUpdate}
+                className="px-8 py-3 bg-blue-600 hover:bg-blue-500 rounded-lg text-lg font-semibold transition-colors"
+              >
+                Atualizar Agora
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="max-w-2xl w-full space-y-8">
         <div className="text-center">
           <h1 className="text-4xl font-bold mb-2">🎤 Dicta</h1>
@@ -392,6 +527,16 @@ function App() {
             }`}
           >
             Histórico ({transcriptionHistory.length})
+          </button>
+          <button
+            onClick={() => setCurrentView("queue")}
+            className={`flex-1 py-2 px-4 rounded transition-colors ${
+              currentView === "queue"
+                ? "bg-blue-600 text-white"
+                : "text-gray-400 hover:bg-gray-700"
+            }`}
+          >
+            Fila{queueCount > 0 ? ` (${queueCount})` : ""}
           </button>
           <button
             onClick={() => setCurrentView("stats")}
@@ -472,6 +617,21 @@ function App() {
                 </button>
               </div>
 
+              {/* Offline Queue Indicator */}
+              {queueCount > 0 && (
+                <div className="flex items-center justify-between border-b border-gray-700 pb-4">
+                  <span className="text-sm text-yellow-400">
+                    {queueCount} {queueCount === 1 ? "item" : "itens"} pendente{queueCount > 1 ? "s" : ""} na fila
+                  </span>
+                  <button
+                    onClick={() => setCurrentView("queue")}
+                    className="px-3 py-1 rounded text-xs bg-yellow-600 text-white hover:bg-yellow-500 transition-colors"
+                  >
+                    Ver Fila
+                  </button>
+                </div>
+              )}
+
               <div className="flex items-center justify-between">
                 <span className="text-sm text-gray-400">Status:</span>
                 <span className={`font-medium ${isRecording ? "text-red-500 animate-pulse" : "text-green-400"}`}>
@@ -536,6 +696,127 @@ function App() {
                       >
                         📋 Copiar
                       </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ) : currentView === "queue" ? (
+          <div className="bg-gray-800 rounded-lg p-6">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-semibold">Fila de Pendentes</h2>
+              {queueItems.length > 0 && (
+                <button
+                  onClick={async () => {
+                    setQueueRetrying(true);
+                    try {
+                      await invoke("retry_pending_queue");
+                    } catch (e) {
+                      console.error("Retry all failed:", e);
+                    }
+                    setTimeout(() => setQueueRetrying(false), 2000);
+                  }}
+                  className="px-3 py-1 bg-yellow-600 hover:bg-yellow-500 rounded text-sm transition-colors disabled:opacity-50"
+                  disabled={queueRetrying}
+                >
+                  {queueRetrying ? "Processando..." : "Retry Todos"}
+                </button>
+              )}
+            </div>
+
+            {queueItems.length === 0 ? (
+              <div className="text-center py-12">
+                <p className="text-4xl mb-3">&#10003;</p>
+                <p className="text-gray-400">Nenhum item pendente na fila</p>
+                <p className="text-gray-500 text-sm mt-1">
+                  Itens aparecem aqui quando falham por problemas de conexao
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {queueItems.map((item) => (
+                  <div
+                    key={item.id}
+                    className="bg-gray-700/50 rounded-lg p-4 hover:bg-gray-700 transition-colors"
+                  >
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-2">
+                          <span className={`px-2 py-0.5 rounded text-xs font-medium ${
+                            item.mode.includes("audio") || item.mode.includes("transcribe")
+                              ? "bg-purple-600/30 text-purple-300"
+                              : "bg-blue-600/30 text-blue-300"
+                          }`}>
+                            {item.mode === "realtime-audio" ? "Realtime Audio"
+                             : item.mode === "whisper-transcribe" ? "Whisper"
+                             : item.mode === "whisper-prompt" ? "Whisper + Prompt"
+                             : item.mode === "realtime-prompt" ? "Realtime + Prompt"
+                             : item.mode === "text-prompt" ? "Texto"
+                             : item.mode}
+                          </span>
+                          <span className="text-xs text-gray-500">{item.model}</span>
+                        </div>
+                        <p className="text-sm text-gray-400">
+                          {formatDate(item.created_at)}
+                        </p>
+                        {item.prompt_text && (
+                          <p className="text-sm text-gray-300 mt-1 truncate">
+                            {item.prompt_text.substring(0, 120)}
+                            {item.prompt_text.length > 120 ? "..." : ""}
+                          </p>
+                        )}
+                        {item.audio_path && !item.prompt_text && (
+                          <p className="text-xs text-gray-500 mt-1">
+                            Audio salvo em disco
+                          </p>
+                        )}
+                        {item.retry_count > 0 && (
+                          <p className="text-xs text-yellow-500 mt-1">
+                            {item.retry_count} tentativa{item.retry_count > 1 ? "s" : ""}
+                          </p>
+                        )}
+                      </div>
+                      <div className="flex gap-2 flex-shrink-0">
+                        {item.audio_path && (
+                          <button
+                            onClick={async () => {
+                              try {
+                                await invoke("play_queue_audio", { audioPath: item.audio_path });
+                              } catch (e) {
+                                console.error("Play failed:", e);
+                              }
+                            }}
+                            className="px-3 py-1 bg-green-600/80 hover:bg-green-500 rounded text-sm transition-colors"
+                          >
+                            Play
+                          </button>
+                        )}
+                        <button
+                          onClick={async () => {
+                            try {
+                              await invoke("retry_single_queue_item", { id: item.id });
+                            } catch (e) {
+                              console.error("Retry failed:", e);
+                            }
+                          }}
+                          className="px-3 py-1 bg-yellow-600 hover:bg-yellow-500 rounded text-sm transition-colors"
+                        >
+                          Retry
+                        </button>
+                        <button
+                          onClick={async () => {
+                            try {
+                              await invoke("delete_single_queue_item", { id: item.id });
+                            } catch (e) {
+                              console.error("Delete failed:", e);
+                            }
+                          }}
+                          className="px-3 py-1 bg-red-600/80 hover:bg-red-500 rounded text-sm transition-colors"
+                        >
+                          Excluir
+                        </button>
+                      </div>
                     </div>
                   </div>
                 ))}

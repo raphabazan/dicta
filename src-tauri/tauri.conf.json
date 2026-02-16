@@ -11,6 +11,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
@@ -126,10 +127,13 @@
             "core:tray:allow-new",
             "core:tray:allow-set-icon",
             "core:tray:allow-set-menu",
-            "core:tray:allow-set-tooltip"
+            "core:tray:allow-set-tooltip",
+            "updater:allow-check",
+            "updater:allow-download-and-install",
+            "process:allow-restart"
           ],
           "commands": {
-            "allow": ["start_recording_audio", "stop_recording_audio", "cancel_recording", "stop_tts_playback", "get_tts_enabled", "set_tts_enabled", "get_selected_prompt_model", "set_selected_prompt_model"]
+            "allow": ["start_recording_audio", "stop_recording_audio", "cancel_recording", "stop_tts_playback", "get_tts_enabled", "set_tts_enabled", "get_selected_prompt_model", "set_selected_prompt_model", "get_queue_count", "get_queue_items", "retry_pending_queue", "delete_single_queue_item", "retry_single_queue_item", "play_queue_audio"]
           }
         }
       ]
@@ -142,6 +146,15 @@
     "globalShortcut": {
       "shortcuts": []
     },
-    "clipboardManager": {}
+    "clipboardManager": {},
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDUxMzZDQjRBM0Y2NUJBRUEKUldUcXVtVS9Tc3MyVVdDTG85NXhuMVVENGhsejZvR2tzWWxzV3cwd2ZOSzZTT0JqSFBPUE5MWTIK",
+      "endpoints": [
+        "https://github.com/raphabazan/dicta/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

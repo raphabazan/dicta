@@ -1,7 +1,15 @@
 // Generate sound effects using Web Audio API
 
+function createAudioContext(): AudioContext {
+  const ctx = new AudioContext();
+  if (ctx.state === "suspended") {
+    ctx.resume();
+  }
+  return ctx;
+}
+
 export function playStartSound() {
-  const audioContext = new AudioContext();
+  const audioContext = createAudioContext();
   const oscillator = audioContext.createOscillator();
   const gainNode = audioContext.createGain();
 
@@ -20,7 +28,7 @@ export function playStartSound() {
 }
 
 export function playStopSound() {
-  const audioContext = new AudioContext();
+  const audioContext = createAudioContext();
   const oscillator = audioContext.createOscillator();
   const gainNode = audioContext.createGain();
 
@@ -39,7 +47,7 @@ export function playStopSound() {
 }
 
 export function playCancelSound() {
-  const audioContext = new AudioContext();
+  const audioContext = createAudioContext();
   const oscillator = audioContext.createOscillator();
   const gainNode = audioContext.createGain();
 
@@ -57,7 +65,7 @@ export function playCancelSound() {
 }
 
 export function playResponseSound() {
-  const audioContext = new AudioContext();
+  const audioContext = createAudioContext();
 
   // First chime: 880Hz
   const osc1 = audioContext.createOscillator();

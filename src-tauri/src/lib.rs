@@ -3,12 +3,14 @@ mod openai;
 mod realtime;
 mod db;
 mod system_audio;
+mod queue;
 
 use tauri::{Emitter, Manager, State, AppHandle, PhysicalPosition};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, GlobalShortcutExt};
 use tauri_plugin_clipboard_manager::ClipboardExt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use enigo::{Enigo, Key, Keyboard, Settings};
@@ -146,6 +148,7 @@ struct AppState {
     tts_sink: Arc<Mutex<Option<rodio::Sink>>>,
     tts_stream_handle: Arc<Mutex<Option<rodio::OutputStreamHandle>>>,
     tts_active: Arc<Mutex<bool>>,
+    queue_dir: PathBuf,
 }
 
 /// Play TTS audio in chunks (sentence by sentence) with visual widget feedback.
@@ -300,10 +303,7 @@ async fn start_recording_audio(state: State<'_, AppState>, app: AppHandle) -> Re
     recorder.start_recording(selected_mic)?;
     *is_recording = true;
 
-    // Small delay so the frontend start-sound (150ms) finishes before muting
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Mute system audio while recording
+    // Mute system audio while recording (frontend already waited for start sound to finish)
     if let Err(e) = system_audio::mute_system_audio() {
         eprintln!("⚠️ Failed to mute system audio: {}", e);
     }
@@ -452,6 +452,8 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
     let tts_stream_handle = state.tts_stream_handle.clone();
     let tts_active = state.tts_active.clone();
     let openai_for_tts = state.openai_client.clone();
+    let queue_dir = state.queue_dir.clone();
+    let audio_data_for_queue = audio_data.clone();
     tokio::spawn(async move {
         match openai.transcribe_audio(audio_data, 48000).await {
             Ok(transcribed_text) => {
@@ -514,7 +516,22 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
                                 ));
                             }
                         }
-                        Err(e) => eprintln!("❌ GPT prompt error: {}", e),
+                        Err(e) => {
+                            eprintln!("❌ GPT prompt error: {}", e);
+                            let count = database.count_queue().unwrap_or(0);
+                            if count < queue::MAX_QUEUE_SIZE {
+                                let _ = database.enqueue_item(
+                                    "whisper-prompt",
+                                    None,
+                                    Some(&transcribed_text),
+                                    &model,
+                                    now_ms(),
+                                );
+                                emit_queue_updated(&app_handle, &database);
+                            } else {
+                                emit_queue_full(&app_handle);
+                            }
+                        }
                     }
                 } else {
                     // Normal transcription mode
@@ -557,7 +574,29 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
                     // TTS skipped for transcribe-only (would just repeat what user said)
                 }
             }
-            Err(e) => eprintln!("❌ Transcription error: {}", e),
+            Err(e) => {
+                eprintln!("❌ Transcription error: {}", e);
+                let count = database.count_queue().unwrap_or(0);
+                if count < queue::MAX_QUEUE_SIZE {
+                    let mode = if prompt_mode.is_some() { "whisper-prompt" } else { "whisper-transcribe" };
+                    let model_name = prompt_mode.as_deref().unwrap_or("whisper");
+                    match queue::save_audio_to_wav(audio_data_for_queue, &queue_dir) {
+                        Ok(wav_path) => {
+                            let _ = database.enqueue_item(
+                                mode,
+                                Some(wav_path.to_str().unwrap_or("")),
+                                None,
+                                model_name,
+                                now_ms(),
+                            );
+                            emit_queue_updated(&app_handle, &database);
+                        }
+                        Err(wav_err) => eprintln!("❌ Failed to save audio to queue: {}", wav_err),
+                    }
+                } else {
+                    emit_queue_full(&app_handle);
+                }
+            }
         }
     });
 
@@ -689,6 +728,21 @@ fn get_conversation_history(database: &db::Database) -> Vec<db::ConversationMess
     database.load_conversation_history(6).unwrap_or_default()
 }
 
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64
+}
+
+fn emit_queue_updated(app: &AppHandle, database: &db::Database) {
+    let count = database.count_queue().unwrap_or(0);
+    tlog!("Queue updated, {} items pending", count);
+    let _ = app.emit("queue-updated", count);
+}
+
+fn emit_queue_full(app: &AppHandle) {
+    tlog!("Queue full (3 items), dropping new item");
+    let _ = app.emit("queue-full", ());
+}
+
 /// Estimate cost in hundredths of a cent based on model and usage
 fn estimate_cost_cents(model: &str, duration_ms: Option<i64>, text: &str) -> i64 {
     match model {
@@ -775,6 +829,19 @@ async fn send_text_prompt(state: State<'_, AppState>, app: AppHandle, prompt: St
             }
             Err(e) => {
                 eprintln!("❌ Text prompt failed: {}", e);
+                let count = database.count_queue().unwrap_or(0);
+                if count < queue::MAX_QUEUE_SIZE {
+                    let _ = database.enqueue_item(
+                        "text-prompt",
+                        None,
+                        Some(&prompt),
+                        &model,
+                        now_ms(),
+                    );
+                    emit_queue_updated(&app_handle, &database);
+                } else {
+                    emit_queue_full(&app_handle);
+                }
             }
         }
     });
@@ -792,10 +859,7 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
     println!("🎤 Starting realtime transcription...");
     *is_recording = true;
 
-    // Small delay so the frontend start-sound (150ms) finishes before muting
-    std::thread::sleep(Duration::from_millis(200));
-
-    // Mute system audio while recording
+    // Mute system audio while recording (frontend already waited for start sound to finish)
     if let Err(e) = system_audio::mute_system_audio() {
         eprintln!("⚠️ Failed to mute system audio: {}", e);
     }
@@ -829,16 +893,31 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
     let last_transcription_time_for_listener = state.last_transcription_time.clone();
     let last_transcription_time_for_stop = state.last_transcription_time.clone();
     let app_handle = app.clone();
+    let queue_dir_for_spawn = state.queue_dir.clone();
+    let database_for_spawn = state.database.clone();
 
     tokio::spawn(async move {
         match realtime_client.connect().await {
             Ok(session) => {
                 println!("✅ Connected to Realtime API");
 
+                // Local audio buffer for crash recovery
+                let local_audio_buffer: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
+                let buffer_for_audio_thread = local_audio_buffer.clone();
+                // Flag to detect connection loss (set by audio send task on WebSocket error)
+                let connection_lost = Arc::new(Mutex::new(false));
+                let connection_lost_for_audio = connection_lost.clone();
+
                 // Configure session
                 if let Err(e) = session.configure_transcription().await {
                     eprintln!("❌ Failed to configure session: {}", e);
                     *is_recording_flag.lock().unwrap() = false;
+                    if let Err(ue) = system_audio::unmute_system_audio() {
+                        eprintln!("⚠️ Failed to unmute on error: {}", ue);
+                    }
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.emit("recording-error", format!("Falha na configuração: {}", e));
+                    }
                     return;
                 }
 
@@ -863,13 +942,16 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
                         }
                     };
 
-                    // Forward audio chunks to the async channel
+                    // Forward audio chunks to the async channel + accumulate locally
                     while let Some(chunk) = local_audio_rx.blocking_recv() {
                         // Check if we should stop
                         if !*is_recording_for_audio.lock().unwrap() {
                             println!("🛑 Audio thread detected stop signal");
                             break;
                         }
+
+                        // Accumulate in local buffer for crash recovery
+                        buffer_for_audio_thread.lock().unwrap().extend_from_slice(&chunk);
 
                         if audio_tx.send(chunk).is_err() {
                             println!("🛑 Audio receiver closed");
@@ -893,6 +975,7 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
                         let audio_bytes = audio::pcm_to_bytes(&audio_chunk);
                         if let Err(e) = session_for_audio.send_audio(&audio_bytes).await {
                             eprintln!("❌ Failed to send audio: {}", e);
+                            *connection_lost_for_audio.lock().unwrap() = true;
                             break;
                         }
                     }
@@ -1038,12 +1121,49 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
                     }
 
                     if listen_task.is_finished() {
-                        println!("🛑 Listen task finished unexpectedly");
-                        break;
+                        println!("🛑 Listen task finished unexpectedly (connection dropped)");
+                        // Connection dropped mid-recording — error cleanup
+                        audio_task.abort();
+                        listen_task.abort();
+                        *is_recording_flag.lock().unwrap() = false;
+                        if let Err(ue) = system_audio::unmute_system_audio() {
+                            eprintln!("⚠️ Failed to unmute on connection drop: {}", ue);
+                        }
+
+                        // Save buffered audio to queue for later retry
+                        let buffer = local_audio_buffer.lock().unwrap();
+                        if !buffer.is_empty() {
+                            println!("💾 Saving {} samples of buffered audio to queue", buffer.len());
+                            match queue::save_audio_i16_to_wav(&buffer, 24000, &queue_dir_for_spawn) {
+                                Ok(wav_path) => {
+                                    let count = database_for_spawn.count_queue().unwrap_or(0);
+                                    if count < queue::MAX_QUEUE_SIZE {
+                                        let _ = database_for_spawn.enqueue_item(
+                                            "realtime-audio",
+                                            Some(wav_path.to_str().unwrap_or("")),
+                                            None,
+                                            "whisper",
+                                            now_ms(),
+                                        );
+                                        emit_queue_updated(&app_handle, &database_for_spawn);
+                                    } else {
+                                        emit_queue_full(&app_handle);
+                                        queue::delete_wav_file(wav_path.to_str().unwrap_or(""));
+                                    }
+                                }
+                                Err(e) => eprintln!("❌ Failed to save audio buffer: {}", e),
+                            }
+                        }
+
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let _ = window.emit("recording-error", "Conexão perdida durante gravação".to_string());
+                        }
+                        println!("✅ Connection-drop cleanup complete");
+                        return;
                     }
                 }
 
-                // Mic stopped. Now:
+                // Mic stopped (normal stop by user). Now:
                 // 1. Force-commit the audio buffer so API processes whatever was in-flight
                 // 2. Wait for transcription.completed to arrive (not speech_stopped which may not come)
                 // 3. Timeout quickly if nothing was in-flight
@@ -1100,12 +1220,47 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
                 audio_task.abort();
                 listen_task.abort();
 
+                // Check if connection was lost during recording (audio send failed)
+                // If so, save the local audio buffer to queue for later retry via Whisper
+                if *connection_lost.lock().unwrap() {
+                    println!("⚠️ Connection was lost during recording, saving audio buffer to queue");
+                    let buffer = local_audio_buffer.lock().unwrap();
+                    if !buffer.is_empty() {
+                        println!("💾 Saving {} samples of buffered audio to queue", buffer.len());
+                        match queue::save_audio_i16_to_wav(&buffer, 24000, &queue_dir_for_spawn) {
+                            Ok(wav_path) => {
+                                let count = database_for_spawn.count_queue().unwrap_or(0);
+                                if count < queue::MAX_QUEUE_SIZE {
+                                    let _ = database_for_spawn.enqueue_item(
+                                        "realtime-audio",
+                                        Some(wav_path.to_str().unwrap_or("")),
+                                        None,
+                                        "whisper",
+                                        now_ms(),
+                                    );
+                                    emit_queue_updated(&app_handle, &database_for_spawn);
+                                } else {
+                                    emit_queue_full(&app_handle);
+                                    queue::delete_wav_file(wav_path.to_str().unwrap_or(""));
+                                }
+                            }
+                            Err(e) => eprintln!("❌ Failed to save audio buffer: {}", e),
+                        }
+                    }
+                }
+
                 println!("✅ Session cleanup complete");
                 *is_recording_flag.lock().unwrap() = false;
             }
             Err(e) => {
                 eprintln!("❌ Failed to connect to Realtime API: {}", e);
                 *is_recording_flag.lock().unwrap() = false;
+                if let Err(ue) = system_audio::unmute_system_audio() {
+                    eprintln!("⚠️ Failed to unmute on connect error: {}", ue);
+                }
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.emit("recording-error", format!("Falha na conexão: {}", e));
+                }
             }
         }
     });
@@ -1121,6 +1276,11 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
         let mut is_recording = state.is_recording.lock().unwrap();
         if !*is_recording {
             println!("⚠️ Not recording (is_recording already false)");
+            // Defensive unmute in case spawn exited without unmuting
+            drop(is_recording);
+            if let Err(e) = system_audio::unmute_system_audio() {
+                eprintln!("⚠️ Failed to defensive unmute: {}", e);
+            }
             return Err("Not recording".to_string());
         }
 
@@ -1279,7 +1439,22 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
                             ));
                         }
                     }
-                    Err(e) => eprintln!("❌ GPT prompt error: {}", e),
+                    Err(e) => {
+                        eprintln!("❌ GPT prompt error: {}", e);
+                        let count = database.count_queue().unwrap_or(0);
+                        if count < queue::MAX_QUEUE_SIZE {
+                            let _ = database.enqueue_item(
+                                "realtime-prompt",
+                                None,
+                                Some(&transcript_clone),
+                                &selected_model,
+                                now_ms(),
+                            );
+                            emit_queue_updated(&app_clone, &database);
+                        } else {
+                            emit_queue_full(&app_clone);
+                        }
+                    }
                 }
             });
         } else {
@@ -1382,6 +1557,216 @@ fn stop_tts_playback(state: State<'_, AppState>, app: AppHandle) -> Result<(), S
     Ok(())
 }
 
+// --- Queue commands ---
+
+#[tauri::command]
+fn get_queue_count(state: State<'_, AppState>) -> Result<i64, String> {
+    state.database.count_queue().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_queue_items(state: State<'_, AppState>) -> Result<Vec<db::PendingQueueItem>, String> {
+    state.database.load_queue().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn retry_pending_queue(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+    let database = state.database.clone();
+    let openai = state.openai_client.clone();
+    let last_transcription = state.last_transcription.clone();
+    let app_handle = app.clone();
+
+    tokio::spawn(async move {
+        process_retry_queue(database, openai, last_transcription, app_handle).await;
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_single_queue_item(state: State<'_, AppState>, app: AppHandle, id: i64) -> Result<(), String> {
+    // Find item to delete its WAV file if it has one
+    let items = state.database.load_queue().map_err(|e| e.to_string())?;
+    if let Some(item) = items.iter().find(|i| i.id == id) {
+        if let Some(ref path) = item.audio_path {
+            queue::delete_wav_file(path);
+        }
+    }
+    state.database.delete_queue_item(id).map_err(|e| e.to_string())?;
+    emit_queue_updated(&app, &state.database);
+    Ok(())
+}
+
+#[tauri::command]
+async fn retry_single_queue_item(state: State<'_, AppState>, app: AppHandle, id: i64) -> Result<(), String> {
+    let database = state.database.clone();
+    let openai = state.openai_client.clone();
+    let last_transcription = state.last_transcription.clone();
+    let app_handle = app.clone();
+
+    let items = database.load_queue().map_err(|e| e.to_string())?;
+    let item = items.into_iter().find(|i| i.id == id)
+        .ok_or_else(|| "Item não encontrado na fila".to_string())?;
+
+    tokio::spawn(async move {
+        let result = process_single_queue_item(&item, &database, &openai, &last_transcription, &app_handle).await;
+        handle_queue_item_result(result, &item, &database, &app_handle);
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn play_queue_audio(state: State<'_, AppState>, audio_path: String) -> Result<(), String> {
+    let handle = state.tts_stream_handle.lock().unwrap();
+    let h = handle.as_ref().ok_or("Saída de áudio não disponível")?;
+
+    let file = std::fs::File::open(&audio_path)
+        .map_err(|e| format!("Erro ao abrir arquivo: {}", e))?;
+    let buf = std::io::BufReader::new(file);
+    let source = rodio::Decoder::new(buf)
+        .map_err(|e| format!("Erro ao decodificar áudio: {}", e))?;
+
+    // Stop any previous queue playback, reuse TTS sink
+    {
+        let mut sg = state.tts_sink.lock().unwrap();
+        if let Some(s) = sg.take() { s.stop(); }
+    }
+
+    let sink = rodio::Sink::try_new(h)
+        .map_err(|e| format!("Erro ao criar player: {}", e))?;
+    sink.append(source);
+    *state.tts_sink.lock().unwrap() = Some(sink);
+
+    println!("🔊 Playing queue audio: {}", audio_path);
+    Ok(())
+}
+
+/// Process a single queue item: retry the API call
+async fn process_single_queue_item(
+    item: &db::PendingQueueItem,
+    database: &Arc<db::Database>,
+    openai: &Arc<openai::OpenAIClient>,
+    last_transcription: &Arc<Mutex<Option<String>>>,
+    app: &AppHandle,
+) -> Result<(), String> {
+    match item.mode.as_str() {
+        "whisper-transcribe" => {
+            let path = item.audio_path.as_ref().ok_or("No audio path for whisper-transcribe item")?;
+            let audio = queue::read_wav_to_f32(path)?;
+            let text = openai.transcribe_audio(audio, 48000).await?;
+            tlog!("Queue retry: whisper-transcribe succeeded for id={}", item.id);
+            let ts = now_ms();
+            let cost = estimate_cost_cents("whisper", None, &text);
+            let _ = database.save_transcription(&text, ts, None, Some("whisper"), Some(cost), Some("transcription"));
+            *last_transcription.lock().unwrap() = Some(text.clone());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("history-updated", ());
+            }
+            let _ = auto_paste_text(app, &text);
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("response-ready", ());
+            }
+            Ok(())
+        }
+        "realtime-audio" => {
+            let path = item.audio_path.as_ref().ok_or("No audio path for realtime-audio item")?;
+            let (audio, sample_rate) = queue::read_wav_to_f32_with_rate(path)?;
+            let text = openai.transcribe_audio(audio, sample_rate).await?;
+            tlog!("Queue retry: realtime-audio succeeded for id={}", item.id);
+            let ts = now_ms();
+            let cost = estimate_cost_cents("whisper", None, &text);
+            let _ = database.save_transcription(&text, ts, None, Some("whisper"), Some(cost), Some("transcription"));
+            *last_transcription.lock().unwrap() = Some(text.clone());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("history-updated", ());
+            }
+            let _ = auto_paste_text(app, &text);
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("response-ready", ());
+            }
+            Ok(())
+        }
+        "whisper-prompt" | "text-prompt" | "realtime-prompt" => {
+            let text = item.prompt_text.as_ref().ok_or("No prompt text for queue item")?;
+            let conv_history = get_conversation_history(database);
+            let response = openai.send_prompt(text, &item.model, &conv_history, None).await?;
+            tlog!("Queue retry: {} succeeded for id={}", item.mode, item.id);
+            let ts = now_ms();
+            let cost = estimate_cost_cents(&item.model, None, &response);
+            let _ = database.save_transcription(&response, ts, None, Some(&item.model), Some(cost), Some("prompt"));
+            let _ = database.append_conversation("user", text, ts - 1);
+            let _ = database.append_conversation("assistant", &response, ts);
+            *last_transcription.lock().unwrap() = Some(response.clone());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("history-updated", ());
+            }
+            let _ = auto_paste_text(app, &response);
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("response-ready", ());
+            }
+            Ok(())
+        }
+        _ => Err(format!("Unknown queue mode: {}", item.mode)),
+    }
+}
+
+/// Handle result of processing a queue item: delete on success, increment retry on failure
+fn handle_queue_item_result(
+    result: Result<(), String>,
+    item: &db::PendingQueueItem,
+    database: &Arc<db::Database>,
+    app: &AppHandle,
+) {
+    match result {
+        Ok(()) => {
+            let _ = database.delete_queue_item(item.id);
+            if let Some(ref path) = item.audio_path {
+                queue::delete_wav_file(path);
+            }
+            let _ = app.emit("queue-item-completed", item.id);
+            emit_queue_updated(app, database);
+        }
+        Err(e) => {
+            eprintln!("❌ Queue retry failed for id={}: {}", item.id, e);
+            let _ = database.increment_retry_count(item.id);
+            emit_queue_updated(app, database);
+        }
+    }
+}
+
+/// Process pending queue items: retry API calls for each item
+async fn process_retry_queue(
+    database: Arc<db::Database>,
+    openai: Arc<openai::OpenAIClient>,
+    last_transcription: Arc<Mutex<Option<String>>>,
+    app: AppHandle,
+) {
+    if !queue::is_online() {
+        tlog!("Queue retry: offline, skipping");
+        return;
+    }
+
+    let items = match database.load_queue() {
+        Ok(items) => items,
+        Err(e) => {
+            eprintln!("❌ Failed to load queue: {}", e);
+            return;
+        }
+    };
+
+    if items.is_empty() {
+        return;
+    }
+
+    tlog!("Queue retry: processing {} items", items.len());
+
+    for item in items {
+        let result = process_single_queue_item(&item, &database, &openai, &last_transcription, &app).await;
+        handle_queue_item_result(result, &item, &database, &app);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Load .env file
@@ -1424,6 +1809,14 @@ pub fn run() {
         }
     };
 
+    // Initialize queue directory (in app data, not project dir, to avoid triggering dev hot-reload)
+    let queue_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::env::current_dir().expect("Failed to get current directory"))
+        .join("com.dicta.app")
+        .join("queue");
+    std::fs::create_dir_all(&queue_dir).ok();
+    println!("📁 Queue directory: {}", queue_dir.display());
+
     // Initialize app state
     let app_state = AppState {
         audio_recorder: Arc::new(Mutex::new(audio::AudioRecorder::new())),
@@ -1444,6 +1837,7 @@ pub fn run() {
         tts_sink: Arc::new(Mutex::new(None)),
         tts_stream_handle: Arc::new(Mutex::new(tts_stream_handle_val)),
         tts_active: Arc::new(Mutex::new(false)),
+        queue_dir,
     };
 
     // Debounce: prevent multiple triggers when keys are held down
@@ -1456,6 +1850,8 @@ pub fn run() {
     tauri::Builder::default()
         .manage(app_state)
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(move |app, shortcut, event| {
@@ -1824,7 +2220,13 @@ pub fn run() {
             get_statistics,
             get_tts_enabled,
             set_tts_enabled,
-            stop_tts_playback
+            stop_tts_playback,
+            get_queue_count,
+            get_queue_items,
+            retry_pending_queue,
+            delete_single_queue_item,
+            retry_single_queue_item,
+            play_queue_audio
         ])
         .setup(|app| {
             // Create tray menu
@@ -1900,6 +2302,27 @@ pub fn run() {
 
             let shortcut_tts_action = Shortcut::new(Some(Modifiers::ALT | Modifiers::SHIFT), Code::KeyS);
             app.global_shortcut().register(shortcut_tts_action).unwrap();
+
+            // Start background queue retry loop (every 30 seconds)
+            {
+                let state = app.state::<AppState>();
+                let db_for_queue = state.database.clone();
+                let openai_for_queue = state.openai_client.clone();
+                let last_tx_for_queue = state.last_transcription.clone();
+                let app_for_queue = app.handle().clone();
+
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        process_retry_queue(
+                            db_for_queue.clone(),
+                            openai_for_queue.clone(),
+                            last_tx_for_queue.clone(),
+                            app_for_queue.clone(),
+                        ).await;
+                    }
+                });
+            }
 
             println!("✅ Dicta is running!");
             println!("📌 Press Ctrl+Space to start/stop recording");

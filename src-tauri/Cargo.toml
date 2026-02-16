@@ -27,6 +27,9 @@ enigo = "0.2"
 http = "1.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rodio = "0.19"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+dirs = "5"
 
 [dependencies.windows]
 version = "0.58"

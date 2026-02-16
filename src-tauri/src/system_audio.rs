@@ -41,12 +41,14 @@ pub fn mute_system_audio() -> Result<(), String> {
 /// If the user already had it muted, we leave it muted.
 pub fn unmute_system_audio() -> Result<(), String> {
     let was_muted = {
-        let mut guard = WAS_MUTED_BEFORE.lock().unwrap();
-        guard.take()
+        let guard = WAS_MUTED_BEFORE.lock().unwrap();
+        guard.clone()
     };
 
     match was_muted {
         Some(true) => {
+            // User already had system muted before recording, leave it muted
+            *WAS_MUTED_BEFORE.lock().unwrap() = None;
             println!("🔇 System was already muted before recording, leaving muted");
             Ok(())
         }
@@ -69,6 +71,9 @@ pub fn unmute_system_audio() -> Result<(), String> {
                 volume
                     .SetMute(false, std::ptr::null())
                     .map_err(|e| format!("SetMute(false) failed: {}", e))?;
+
+                // Only clear state after successful unmute
+                *WAS_MUTED_BEFORE.lock().unwrap() = None;
 
                 println!("🔊 System audio unmuted (restored to pre-recording state)");
                 Ok(())

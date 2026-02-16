@@ -29,6 +29,17 @@ pub struct StatsData {
     pub total_cost_cents: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingQueueItem {
+    pub id: i64,
+    pub mode: String,              // 'whisper-transcribe' | 'whisper-prompt' | 'text-prompt' | 'realtime-prompt'
+    pub audio_path: Option<String>, // absolute path to WAV file (only for whisper-transcribe)
+    pub prompt_text: Option<String>, // text for send_prompt retry
+    pub model: String,
+    pub created_at: i64,
+    pub retry_count: i64,
+}
+
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
 }
@@ -96,6 +107,26 @@ impl Database {
                 [],
             )?;
             println!("📦 Database migrated to schema version 1 (added stats columns)");
+        }
+
+        if schema_version < 2 {
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS pending_queue (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mode        TEXT    NOT NULL,
+                    audio_path  TEXT,
+                    prompt_text TEXT,
+                    model       TEXT    NOT NULL,
+                    created_at  INTEGER NOT NULL,
+                    retry_count INTEGER NOT NULL DEFAULT 0
+                )",
+                [],
+            )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('schema_version', '2')",
+                [],
+            )?;
+            println!("📦 Database migrated to schema version 2 (added pending_queue)");
         }
 
         println!("✅ Database initialized");
@@ -318,5 +349,74 @@ impl Database {
             total_duration_ms,
             total_cost_cents,
         })
+    }
+
+    // --- Pending Queue methods ---
+
+    pub fn enqueue_item(
+        &self,
+        mode: &str,
+        audio_path: Option<&str>,
+        prompt_text: Option<&str>,
+        model: &str,
+        created_at: i64,
+    ) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO pending_queue (mode, audio_path, prompt_text, model, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![mode, audio_path, prompt_text, model, created_at],
+        )?;
+        let id = conn.last_insert_rowid();
+        println!("📋 Queued item id={} mode={} model={}", id, mode, model);
+        Ok(id)
+    }
+
+    pub fn load_queue(&self) -> Result<Vec<PendingQueueItem>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, mode, audio_path, prompt_text, model, created_at, retry_count
+             FROM pending_queue ORDER BY created_at ASC",
+        )?;
+        let items = stmt
+            .query_map([], |row| {
+                Ok(PendingQueueItem {
+                    id: row.get(0)?,
+                    mode: row.get(1)?,
+                    audio_path: row.get(2)?,
+                    prompt_text: row.get(3)?,
+                    model: row.get(4)?,
+                    created_at: row.get(5)?,
+                    retry_count: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        Ok(items)
+    }
+
+    pub fn delete_queue_item(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM pending_queue WHERE id = ?1", [id])?;
+        println!("🗑️ Deleted queue item id={}", id);
+        Ok(())
+    }
+
+    pub fn count_queue(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_queue",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn increment_retry_count(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE pending_queue SET retry_count = retry_count + 1 WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
     }
 }
