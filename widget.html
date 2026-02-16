@@ -315,7 +315,7 @@
         e.stopPropagation(); // Prevent dragging
         const model = option.dataset.model;
         try {
-          await invoke('set_selected_prompt_model', { model, saveAsDefault: true });
+          await invoke('set_selected_prompt_model', { model, saveAsDefault: false });
           modelOptions.forEach(opt => opt.classList.remove('active'));
           option.classList.add('active');
         } catch (error) {

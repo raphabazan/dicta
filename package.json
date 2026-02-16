@@ -1,6 +1,6 @@
 {
   "name": "dicta",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Smart voice-to-text dictation tool with AI post-processing",
   "type": "module",
   "scripts": {
