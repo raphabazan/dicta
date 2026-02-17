@@ -1,6 +1,6 @@
 [package]
 name = "dicta"
-version = "0.4.0"
+version = "0.4.1"
 description = "Smart voice-to-text dictation tool"
 authors = ["Raphael"]
 edition = "2021"
