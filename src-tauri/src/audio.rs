@@ -19,28 +19,46 @@ pub fn get_input_device_by_name(device_name: Option<&str>) -> Result<cpal::Devic
             .input_devices()
             .map_err(|e| format!("Failed to get input devices: {}", e))?;
 
-        println!("🔍 DEBUG: Listing all available devices:");
-        let mut found = false;
-        for device in devices {
-            if let Ok(device_name_str) = device.name() {
-                let device_name_trimmed = device_name_str.trim();
-                println!("🔍   - Available: '{}' (trimmed: '{}')", device_name_str, device_name_trimmed);
-                println!("🔍     Bytes: {:?}", device_name_trimmed.as_bytes());
+        // Collect all devices for multi-pass matching
+        let all_devices: Vec<_> = devices
+            .filter_map(|d| d.name().ok().map(|n| (n, d)))
+            .collect();
 
-                // Try exact match first, then trimmed match
-                if device_name_str == name || device_name_trimmed == name_trimmed {
-                    println!("✅ Found matching device: {} (match type: {})",
-                             name,
-                             if device_name_str == name { "exact" } else { "trimmed" });
-                    found = true;
-                    return Ok(device);
+        println!("🔍 DEBUG: Available devices:");
+        for (n, _) in &all_devices {
+            println!("🔍   - '{}'", n);
+        }
+
+        // Pass 1: exact match
+        for (ref n, _) in &all_devices {
+            if n.trim() == name_trimmed {
+                println!("✅ Found device (exact): {}", n);
+                // Need to re-query because we can't move out of borrowed vec
+                let host2 = cpal::default_host();
+                let devices2 = host2.input_devices().map_err(|e| format!("{}", e))?;
+                for d in devices2 {
+                    if let Ok(dn) = d.name() {
+                        if dn.trim() == name_trimmed { return Ok(d); }
+                    }
                 }
             }
         }
 
-        if !found {
-            println!("⚠️ Selected device '{}' not found in list, using default", name);
+        // Pass 2: partial match (contains) — handles renamed devices
+        for (ref n, _) in &all_devices {
+            if n.contains(name_trimmed) || name_trimmed.contains(n.trim()) {
+                println!("✅ Found device (partial): '{}' ~ '{}'", n, name_trimmed);
+                let host2 = cpal::default_host();
+                let devices2 = host2.input_devices().map_err(|e| format!("{}", e))?;
+                for d in devices2 {
+                    if let Ok(dn) = d.name() {
+                        if dn == *n { return Ok(d); }
+                    }
+                }
+            }
         }
+
+        println!("⚠️ Selected device '{}' not found, falling back to default", name);
     } else {
         println!("🔍 DEBUG: No device name provided, using default");
     }

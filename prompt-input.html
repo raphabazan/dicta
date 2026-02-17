@@ -74,6 +74,31 @@
       border-color: rgba(99, 102, 241, 0.7);
     }
 
+    .btn-tts {
+      width: 22px;
+      height: 22px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: transparent;
+      border: none;
+      border-radius: 50%;
+      cursor: pointer;
+      padding: 0;
+      transition: all 0.15s;
+    }
+    .btn-tts:hover {
+      background: rgba(107, 114, 128, 0.3);
+      transform: scale(1.1);
+    }
+    .btn-tts svg {
+      width: 15px;
+      height: 15px;
+    }
+    .btn-tts .tts-slash { display: none; }
+    .btn-tts.tts-off .tts-slash { display: block; }
+    .btn-tts.tts-off .tts-waves { display: none; }
+
     .close-btn {
       width: 20px;
       height: 20px;
@@ -204,6 +229,13 @@
           <option value="gpt-4.1">GPT-4.1</option>
           <option value="gpt-4o-mini">GPT-4o-mini</option>
         </select>
+        <button class="btn-tts tts-off" id="ttsBtn" title="TTS OFF">
+          <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M11 5L6 9H2v6h4l5 4V5z" fill="rgba(56, 189, 248, 0.9)"/>
+            <path class="tts-waves" d="M15.54 8.46a5 5 0 010 7.07" stroke="rgba(56, 189, 248, 0.9)" stroke-width="1.5" stroke-linecap="round"/>
+            <path class="tts-slash" d="M3 21L21 3" stroke="#ef4444" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
       </div>
       <div class="drag-region" data-tauri-drag-region></div>
       <button class="close-btn" id="closeBtn" title="Fechar (Esc)">✕</button>
@@ -243,6 +275,34 @@
     const closeBtn = document.getElementById('closeBtn');
     const modelSelect = document.getElementById('modelSelect');
     const statusEl = document.getElementById('status');
+    const ttsBtn = document.getElementById('ttsBtn');
+
+    // TTS state
+    let ttsEnabled = false;
+
+    function updateTtsIcon(enabled) {
+      ttsEnabled = enabled;
+      if (enabled) {
+        ttsBtn.classList.remove('tts-off');
+        ttsBtn.title = 'TTS ON (clique para desativar)';
+      } else {
+        ttsBtn.classList.add('tts-off');
+        ttsBtn.title = 'TTS OFF (clique para ativar)';
+      }
+    }
+
+    invoke('get_tts_enabled').then(val => updateTtsIcon(val)).catch(() => {});
+
+    ttsBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      try {
+        const newVal = !ttsEnabled;
+        await invoke('set_tts_enabled', { enabled: newVal });
+        updateTtsIcon(newVal);
+      } catch (error) {
+        console.error('Failed to toggle TTS:', error);
+      }
+    });
     const imagePreview = document.getElementById('imagePreview');
     const imageThumb = document.getElementById('imageThumb');
     const imageInfo = document.getElementById('imageInfo');
@@ -372,6 +432,7 @@
     window.addEventListener('focus', () => {
       promptInput.focus();
       loadModel();
+      invoke('get_tts_enabled').then(val => updateTtsIcon(val)).catch(() => {});
       // Clear image from previous session
       if (attachedImageData) removeImage();
     });

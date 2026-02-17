@@ -339,11 +339,17 @@ async fn cancel_recording(state: State<'_, AppState>) -> Result<String, String> 
     }
 
     println!("❌ Cancelling recording...");
-
-    // For Whisper mode, just stop recording without processing
-    let recorder = state.audio_recorder.lock().unwrap();
-    let _ = recorder.stop_recording(); // Discard audio data
     *is_recording = false;
+
+    // Stop Whisper mode recorder (discard audio)
+    let recorder = state.audio_recorder.lock().unwrap();
+    let _ = recorder.stop_recording();
+
+    // Stop realtime mode streaming (release microphone + kill WebSocket tasks)
+    if let Some(handle) = state.streaming_stop_handle.lock().unwrap().take() {
+        handle.stop();
+        println!("🔌 Realtime streaming stopped via cancel");
+    }
 
     // Restore system audio
     if let Err(e) = system_audio::unmute_system_audio() {
@@ -969,14 +975,91 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
     let stop_handle_state = state.streaming_stop_handle.clone();
 
     tokio::spawn(async move {
+        // === 1. Start microphone FIRST (before WebSocket connect) ===
+        // This ensures audio is captured locally even if the connection fails.
+        let local_audio_buffer: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
+        let buffer_for_audio_thread = local_audio_buffer.clone();
+
+        let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<i16>>();
+        let is_recording_for_audio = is_recording_flag.clone();
+        let selected_mic_for_thread = selected_mic.clone();
+        let stop_handle_state_for_thread = stop_handle_state.clone();
+
+        println!("🔍 DEBUG: selected_mic_for_thread = {:?}", selected_mic_for_thread);
+
+        std::thread::spawn(move || {
+            println!("🔍 DEBUG: Inside thread, selected_mic = {:?}", selected_mic_for_thread);
+            let mut streaming_recorder = audio::StreamingAudioRecorder::new();
+
+            let mut local_audio_rx = match streaming_recorder.start_streaming(selected_mic_for_thread) {
+                Ok(rx) => rx,
+                Err(e) => {
+                    eprintln!("❌ Failed to start streaming: {}", e);
+                    *is_recording_for_audio.lock().unwrap() = false;
+                    return;
+                }
+            };
+
+            *stop_handle_state_for_thread.lock().unwrap() = Some(streaming_recorder.stop_handle());
+
+            loop {
+                if !*is_recording_for_audio.lock().unwrap() {
+                    println!("🛑 Audio thread detected stop signal");
+                    break;
+                }
+
+                match local_audio_rx.try_recv() {
+                    Ok(chunk) => {
+                        buffer_for_audio_thread.lock().unwrap().extend_from_slice(&chunk);
+                        // audio_tx.send may fail if receiver is dropped (e.g. connect failed) — that's ok
+                        let _ = audio_tx.send(chunk);
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        println!("🛑 Audio channel disconnected");
+                        break;
+                    }
+                }
+            }
+
+            streaming_recorder.stop_streaming();
+            println!("🎤 Audio thread finished");
+        });
+
+        // Helper closure: save buffered audio to queue
+        let save_buffer_to_queue = |buffer: &Arc<Mutex<Vec<i16>>>, queue_dir: &std::path::PathBuf, db: &Arc<crate::db::Database>, app: &AppHandle| {
+            let buf = buffer.lock().unwrap();
+            if !buf.is_empty() {
+                println!("💾 Saving {} samples of buffered audio to queue", buf.len());
+                match queue::save_audio_i16_to_wav(&buf, 24000, queue_dir) {
+                    Ok(wav_path) => {
+                        let count = db.count_queue().unwrap_or(0);
+                        if count < queue::MAX_QUEUE_SIZE {
+                            let _ = db.enqueue_item(
+                                "realtime-audio",
+                                Some(wav_path.to_str().unwrap_or("")),
+                                None,
+                                "whisper",
+                                now_ms(),
+                            );
+                            emit_queue_updated(app, db);
+                        } else {
+                            emit_queue_full(app);
+                            queue::delete_wav_file(wav_path.to_str().unwrap_or(""));
+                        }
+                    }
+                    Err(e) => eprintln!("❌ Failed to save audio buffer: {}", e),
+                }
+            }
+        };
+
+        // === 2. Connect to Realtime API (mic is already recording) ===
         match realtime_client.connect().await {
             Ok(session) => {
                 println!("✅ Connected to Realtime API");
 
-                // Local audio buffer for crash recovery
-                let local_audio_buffer: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
-                let buffer_for_audio_thread = local_audio_buffer.clone();
-                // Flag to detect connection loss (set by audio send task on WebSocket error)
                 let connection_lost = Arc::new(Mutex::new(false));
                 let connection_lost_for_audio = connection_lost.clone();
 
@@ -987,70 +1070,14 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
                     if let Err(ue) = system_audio::unmute_system_audio() {
                         eprintln!("⚠️ Failed to unmute on error: {}", ue);
                     }
+                    // Wait briefly for audio thread to capture some samples before saving
+                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                    save_buffer_to_queue(&local_audio_buffer, &queue_dir_for_spawn, &database_for_spawn, &app_handle);
                     if let Some(window) = app_handle.get_webview_window("main") {
                         let _ = window.emit("recording-error", format!("Falha na configuração: {}", e));
                     }
                     return;
                 }
-
-                // Start audio streaming in a blocking thread (cpal requires this)
-                let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<i16>>();
-                let is_recording_for_audio = is_recording_flag.clone();
-                let selected_mic_for_thread = selected_mic.clone();
-
-                println!("🔍 DEBUG: selected_mic_for_thread = {:?}", selected_mic_for_thread);
-
-                let stop_handle_state_for_thread = stop_handle_state.clone();
-
-                std::thread::spawn(move || {
-                    println!("🔍 DEBUG: Inside thread, selected_mic = {:?}", selected_mic_for_thread);
-                    let mut streaming_recorder = audio::StreamingAudioRecorder::new();
-
-                    // Start streaming and get the channel
-                    let mut local_audio_rx = match streaming_recorder.start_streaming(selected_mic_for_thread) {
-                        Ok(rx) => rx,
-                        Err(e) => {
-                            eprintln!("❌ Failed to start streaming: {}", e);
-                            *is_recording_for_audio.lock().unwrap() = false;
-                            return;
-                        }
-                    };
-
-                    // Store stop handle so microphone can be released from outside
-                    *stop_handle_state_for_thread.lock().unwrap() = Some(streaming_recorder.stop_handle());
-
-                    // Forward audio chunks to the async channel + accumulate locally
-                    // Use timeout-based recv so the thread can check the stop flag promptly
-                    loop {
-                        if !*is_recording_for_audio.lock().unwrap() {
-                            println!("🛑 Audio thread detected stop signal");
-                            break;
-                        }
-
-                        // Try to receive with a short timeout so we can re-check the stop flag
-                        match local_audio_rx.try_recv() {
-                            Ok(chunk) => {
-                                buffer_for_audio_thread.lock().unwrap().extend_from_slice(&chunk);
-                                if audio_tx.send(chunk).is_err() {
-                                    println!("🛑 Audio receiver closed");
-                                    break;
-                                }
-                            }
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                                // No data yet, sleep briefly and retry
-                                std::thread::sleep(std::time::Duration::from_millis(10));
-                            }
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                println!("🛑 Audio channel disconnected");
-                                break;
-                            }
-                        }
-                    }
-
-                    // Clean up - stop_streaming will release the microphone
-                    streaming_recorder.stop_streaming();
-                    println!("🎤 Audio thread finished");
-                });
 
                 // Clone session for sending audio
                 let session_clone = Arc::new(session);
@@ -1210,39 +1237,13 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
 
                     if listen_task.is_finished() {
                         println!("🛑 Listen task finished unexpectedly (connection dropped)");
-                        // Connection dropped mid-recording — error cleanup
                         audio_task.abort();
                         listen_task.abort();
                         *is_recording_flag.lock().unwrap() = false;
                         if let Err(ue) = system_audio::unmute_system_audio() {
                             eprintln!("⚠️ Failed to unmute on connection drop: {}", ue);
                         }
-
-                        // Save buffered audio to queue for later retry
-                        let buffer = local_audio_buffer.lock().unwrap();
-                        if !buffer.is_empty() {
-                            println!("💾 Saving {} samples of buffered audio to queue", buffer.len());
-                            match queue::save_audio_i16_to_wav(&buffer, 24000, &queue_dir_for_spawn) {
-                                Ok(wav_path) => {
-                                    let count = database_for_spawn.count_queue().unwrap_or(0);
-                                    if count < queue::MAX_QUEUE_SIZE {
-                                        let _ = database_for_spawn.enqueue_item(
-                                            "realtime-audio",
-                                            Some(wav_path.to_str().unwrap_or("")),
-                                            None,
-                                            "whisper",
-                                            now_ms(),
-                                        );
-                                        emit_queue_updated(&app_handle, &database_for_spawn);
-                                    } else {
-                                        emit_queue_full(&app_handle);
-                                        queue::delete_wav_file(wav_path.to_str().unwrap_or(""));
-                                    }
-                                }
-                                Err(e) => eprintln!("❌ Failed to save audio buffer: {}", e),
-                            }
-                        }
-
+                        save_buffer_to_queue(&local_audio_buffer, &queue_dir_for_spawn, &database_for_spawn, &app_handle);
                         if let Some(window) = app_handle.get_webview_window("main") {
                             let _ = window.emit("recording-error", "Conexão perdida durante gravação".to_string());
                         }
@@ -1308,33 +1309,10 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
                 audio_task.abort();
                 listen_task.abort();
 
-                // Check if connection was lost during recording (audio send failed)
-                // If so, save the local audio buffer to queue for later retry via Whisper
+                // If connection was lost during recording, save audio buffer to queue
                 if *connection_lost.lock().unwrap() {
                     println!("⚠️ Connection was lost during recording, saving audio buffer to queue");
-                    let buffer = local_audio_buffer.lock().unwrap();
-                    if !buffer.is_empty() {
-                        println!("💾 Saving {} samples of buffered audio to queue", buffer.len());
-                        match queue::save_audio_i16_to_wav(&buffer, 24000, &queue_dir_for_spawn) {
-                            Ok(wav_path) => {
-                                let count = database_for_spawn.count_queue().unwrap_or(0);
-                                if count < queue::MAX_QUEUE_SIZE {
-                                    let _ = database_for_spawn.enqueue_item(
-                                        "realtime-audio",
-                                        Some(wav_path.to_str().unwrap_or("")),
-                                        None,
-                                        "whisper",
-                                        now_ms(),
-                                    );
-                                    emit_queue_updated(&app_handle, &database_for_spawn);
-                                } else {
-                                    emit_queue_full(&app_handle);
-                                    queue::delete_wav_file(wav_path.to_str().unwrap_or(""));
-                                }
-                            }
-                            Err(e) => eprintln!("❌ Failed to save audio buffer: {}", e),
-                        }
-                    }
+                    save_buffer_to_queue(&local_audio_buffer, &queue_dir_for_spawn, &database_for_spawn, &app_handle);
                 }
 
                 println!("✅ Session cleanup complete");
@@ -1342,12 +1320,29 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
             }
             Err(e) => {
                 eprintln!("❌ Failed to connect to Realtime API: {}", e);
-                *is_recording_flag.lock().unwrap() = false;
+                // Mic is already recording — DON'T stop it yet.
+                // Keep recording locally so audio is saved to queue.
+                // Wait for user to press Ctrl+Space (which sets is_recording=false).
+                println!("📡 No connection — recording locally until user stops...");
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    let _ = window.emit("recording-offline", "Sem conexão — gravando localmente".to_string());
+                }
+
+                // Poll until the user stops recording
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    if !*is_recording_flag.lock().unwrap() {
+                        break;
+                    }
+                }
+
+                // Now save the buffered audio to queue
                 if let Err(ue) = system_audio::unmute_system_audio() {
                     eprintln!("⚠️ Failed to unmute on connect error: {}", ue);
                 }
+                save_buffer_to_queue(&local_audio_buffer, &queue_dir_for_spawn, &database_for_spawn, &app_handle);
                 if let Some(window) = app_handle.get_webview_window("main") {
-                    let _ = window.emit("recording-error", format!("Falha na conexão: {}", e));
+                    let _ = window.emit("recording-error", format!("Sem conexão — áudio salvo na fila: {}", e));
                 }
             }
         }
@@ -2182,6 +2177,7 @@ pub fn run() {
                                 }
                             }
                             let _ = prompt_window.show();
+                            let _ = prompt_window.set_focus();
                         }
                     } else if shortcut_str.contains("KeyS") && shortcut_str.contains("CONTROL") && shortcut_str.contains("ALT") {
                         // Ctrl+Alt+S: Toggle TTS

@@ -291,6 +291,9 @@ function App() {
     const unlistenWidgetCancel = listen("recording-cancelled", async () => {
       console.log("❌ Widget cancel event received");
       playCancelSound();
+      isRecordingRef.current = false;
+      isStartingRef.current = false;
+      isStoppingRef.current = false;
       setIsRecording(false);
       setStatus("Cancelled");
       setTimeout(() => setStatus("Ready"), 2000);
@@ -384,6 +387,12 @@ function App() {
       invoke<number>("get_queue_count").then((v) => setQueueCount(v)).catch(() => {});
     });
 
+    // Listen for offline recording (no internet, mic still recording locally)
+    const unlistenRecordingOffline = listen<string>("recording-offline", (event) => {
+      console.warn("📡 Recording offline:", event.payload);
+      setStatus("Sem conexão — gravando localmente");
+    });
+
     // Listen for recording errors (connection drops, API failures)
     const unlistenRecordingError = listen<string>("recording-error", (event) => {
       console.error("❌ Recording error:", event.payload);
@@ -410,6 +419,7 @@ function App() {
       unlistenQueueUpdated.then((fn) => fn());
       unlistenQueueFull.then((fn) => fn());
       unlistenQueueCompleted.then((fn) => fn());
+      unlistenRecordingOffline.then((fn) => fn());
       unlistenRecordingError.then((fn) => fn());
     };
   }, []); // Empty deps - refs always have current values, no need to re-register
