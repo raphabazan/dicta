@@ -228,7 +228,7 @@ async fn play_tts_chunked(
     text: String,
     openai: Arc<openai::OpenAIClient>,
     tts_sink: Arc<Mutex<Option<rodio::Sink>>>,
-    tts_stream_handle: Arc<Mutex<Option<rodio::OutputStreamHandle>>>,
+    _tts_stream_handle: Arc<Mutex<Option<rodio::OutputStreamHandle>>>,
     tts_active: Arc<Mutex<bool>>,
 ) {
     // Set active flag
@@ -250,8 +250,59 @@ async fn play_tts_chunked(
     let chunks = openai::split_into_tts_chunks(&clean_text);
     println!("🔊 TTS chunked playback: {} chunks", chunks.len());
 
+    // Channel to send audio bytes from async context to the playback thread.
+    // The playback thread owns the OutputStream (not Send) and creates Sinks.
+    let (audio_tx, audio_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let tts_active_for_thread = tts_active.clone();
+
+    // Dedicated playback thread — owns the OutputStream so it always uses
+    // the current default output device (not the one from app startup).
+    let playback_thread = std::thread::spawn(move || {
+        let (_stream, stream_handle) = match rodio::OutputStream::try_default() {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("❌ Failed to open audio output for TTS: {}", e);
+                return;
+            }
+        };
+
+        let mut current_sink: Option<rodio::Sink> = None;
+
+        while let Ok(audio_bytes) = audio_rx.recv() {
+            // Check if cancelled
+            if !*tts_active_for_thread.lock().unwrap() { break; }
+
+            // Wait for previous chunk to finish
+            if let Some(ref sink) = current_sink {
+                while !sink.empty() {
+                    if !*tts_active_for_thread.lock().unwrap() { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if !*tts_active_for_thread.lock().unwrap() { break; }
+            }
+
+            // Stop previous and play new
+            if let Some(s) = current_sink.take() { s.stop(); }
+
+            if let Ok(src) = rodio::Decoder::new(std::io::Cursor::new(audio_bytes)) {
+                if let Ok(sink) = rodio::Sink::try_new(&stream_handle) {
+                    sink.append(src);
+                    current_sink = Some(sink);
+                }
+            }
+        }
+
+        // Wait for last chunk to finish playing
+        if let Some(ref sink) = current_sink {
+            while !sink.empty() {
+                if !*tts_active_for_thread.lock().unwrap() { break; }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        // _stream drops here, releasing output device
+    });
+
     for (i, chunk) in chunks.iter().enumerate() {
-        // Check if cancelled
         if !*tts_active.lock().unwrap() {
             println!("🔇 TTS cancelled at chunk {}/{}", i + 1, chunks.len());
             break;
@@ -261,48 +312,14 @@ async fn play_tts_chunked(
 
         match openai.speak_text(chunk).await {
             Ok(audio) => {
-                // Check again after API call
                 if !*tts_active.lock().unwrap() {
                     println!("🔇 TTS cancelled after generating chunk {}", i + 1);
                     break;
                 }
-
-                // Wait for previous chunk to finish playing
-                let needs_wait = {
-                    let sg = tts_sink.lock().unwrap();
-                    sg.as_ref().map(|s| !s.empty()).unwrap_or(false)
-                };
-                if needs_wait {
-                    loop {
-                        if !*tts_active.lock().unwrap() {
-                            println!("🔇 TTS cancelled while waiting for previous chunk");
-                            break;
-                        }
-                        let empty = {
-                            let sg = tts_sink.lock().unwrap();
-                            sg.as_ref().map(|s| s.empty()).unwrap_or(true)
-                        };
-                        if empty { break; }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                    if !*tts_active.lock().unwrap() { break; }
-                }
-
-                // Stop previous sink and play new chunk
-                {
-                    let mut sg = tts_sink.lock().unwrap();
-                    if let Some(s) = sg.take() { s.stop(); }
-                }
-
-                let hg = tts_stream_handle.lock().unwrap();
-                if let Some(h) = hg.as_ref() {
-                    if let Ok(src) = rodio::Decoder::new(std::io::Cursor::new(audio)) {
-                        if let Ok(sink) = rodio::Sink::try_new(h) {
-                            sink.append(src);
-                            *tts_sink.lock().unwrap() = Some(sink);
-                            println!("🔊 TTS chunk {}/{} playing", i + 1, chunks.len());
-                        }
-                    }
+                println!("🔊 TTS chunk {}/{} sent to playback", i + 1, chunks.len());
+                if audio_tx.send(audio).is_err() {
+                    println!("🔇 Playback thread closed");
+                    break;
                 }
             }
             Err(e) => {
@@ -311,17 +328,11 @@ async fn play_tts_chunked(
         }
     }
 
-    // Wait for last chunk to finish
-    loop {
-        let still_active = *tts_active.lock().unwrap();
-        if !still_active { break; }
-        let empty = {
-            let sg = tts_sink.lock().unwrap();
-            sg.as_ref().map(|s| s.empty()).unwrap_or(true)
-        };
-        if empty { break; }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    // Drop sender to signal playback thread there's no more data
+    drop(audio_tx);
+
+    // Wait for playback thread to finish
+    let _ = playback_thread.join();
 
     // Clean up
     *tts_active.lock().unwrap() = false;
@@ -1706,27 +1717,30 @@ async fn retry_single_queue_item(state: State<'_, AppState>, app: AppHandle, id:
 
 #[tauri::command]
 async fn play_queue_audio(state: State<'_, AppState>, audio_path: String) -> Result<(), String> {
-    let handle = state.tts_stream_handle.lock().unwrap();
-    let h = handle.as_ref().ok_or("Saída de áudio não disponível")?;
-
     let file = std::fs::File::open(&audio_path)
         .map_err(|e| format!("Erro ao abrir arquivo: {}", e))?;
     let buf = std::io::BufReader::new(file);
     let source = rodio::Decoder::new(buf)
         .map_err(|e| format!("Erro ao decodificar áudio: {}", e))?;
 
-    // Stop any previous queue playback, reuse TTS sink
+    // Stop any previous playback
     {
         let mut sg = state.tts_sink.lock().unwrap();
         if let Some(s) = sg.take() { s.stop(); }
     }
 
-    let sink = rodio::Sink::try_new(h)
+    // Open fresh output stream to use current default device
+    let (_stream, handle) = rodio::OutputStream::try_default()
+        .map_err(|e| format!("Erro ao abrir saída de áudio: {}", e))?;
+
+    let sink = rodio::Sink::try_new(&handle)
         .map_err(|e| format!("Erro ao criar player: {}", e))?;
     sink.append(source);
-    *state.tts_sink.lock().unwrap() = Some(sink);
 
-    println!("🔊 Playing queue audio: {}", audio_path);
+    // Wait for playback to finish (otherwise _stream drops and audio cuts)
+    sink.sleep_until_end();
+
+    println!("🔊 Finished playing queue audio: {}", audio_path);
     Ok(())
 }
 
