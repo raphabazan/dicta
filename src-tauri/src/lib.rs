@@ -152,6 +152,130 @@ struct AppState {
     streaming_stop_handle: Arc<Mutex<Option<audio::StreamingStopHandle>>>,
 }
 
+const DEFAULT_USE_REALTIME: bool = false;
+const DEFAULT_PROMPT_MODEL: &str = "gpt-4.1";
+const DEFAULT_TRANSCRIPTION_LANGUAGES: [&str; 2] = ["pt", "en"];
+
+fn parse_bool_setting(value: Option<String>, default: bool) -> bool {
+    value
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(default)
+}
+
+fn normalize_prompt_model(model: &str) -> String {
+    match model {
+        "gpt-4.1" | "gpt-4o-mini" | "transcribe-only" => model.to_string(),
+        _ => "transcribe-only".to_string(),
+    }
+}
+
+fn load_selected_prompt_model(database: &db::Database) -> String {
+    database
+        .load_setting("selected_prompt_model")
+        .ok()
+        .flatten()
+        .map(|model| normalize_prompt_model(&model))
+        .unwrap_or_else(|| "transcribe-only".to_string())
+}
+
+fn load_user_prompt_model(database: &db::Database) -> String {
+    database
+        .load_setting("user_prompt_model")
+        .ok()
+        .flatten()
+        .map(|model| normalize_prompt_model(&model))
+        .filter(|model| model != "transcribe-only")
+        .unwrap_or_else(|| DEFAULT_PROMPT_MODEL.to_string())
+}
+
+fn normalize_transcription_languages(languages: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+
+    for language in languages {
+        let value = language.trim().to_lowercase();
+        if value.is_empty() {
+            continue;
+        }
+
+        if !normalized.iter().any(|existing| existing == &value) {
+            normalized.push(value);
+        }
+    }
+
+    if normalized.is_empty() {
+        DEFAULT_TRANSCRIPTION_LANGUAGES
+            .iter()
+            .map(|value| value.to_string())
+            .collect()
+    } else {
+        normalized
+    }
+}
+
+fn load_transcription_languages(database: &db::Database) -> Vec<String> {
+    let stored = database
+        .load_setting("transcription_languages")
+        .ok()
+        .flatten()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|part| part.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    normalize_transcription_languages(stored)
+}
+
+fn save_transcription_languages(database: &db::Database, languages: Vec<String>) -> Result<Vec<String>, String> {
+    let normalized = normalize_transcription_languages(languages);
+    database
+        .save_setting("transcription_languages", &normalized.join(","))
+        .map_err(|e| format!("Failed to save transcription languages: {}", e))?;
+    Ok(normalized)
+}
+
+fn build_transcription_hints(database: &db::Database) -> (Option<String>, Option<String>) {
+    let languages = load_transcription_languages(database);
+
+    if languages.len() == 1 {
+        return (Some(languages[0].clone()), None);
+    }
+
+    let display_names: Vec<&str> = languages
+        .iter()
+        .map(|code| match code.as_str() {
+            "pt" => "Portuguese",
+            "en" => "English",
+            "es" => "Spanish",
+            "fr" => "French",
+            "de" => "German",
+            "it" => "Italian",
+            other => other,
+        })
+        .collect();
+
+    (
+        None,
+        Some(format!(
+            "The audio may contain any of these spoken languages: {}.",
+            display_names.join(", ")
+        )),
+    )
+}
+
+fn resolve_prompt_session(state: &AppState) -> (bool, String) {
+    let current_model = load_selected_prompt_model(&state.database);
+    *state.prompt_mode.lock().unwrap() = None;
+
+    if current_model == "transcribe-only" {
+        (false, String::new())
+    } else {
+        (true, current_model)
+    }
+}
+
 /// Strip markdown links, citations, and raw URLs from text for TTS playback.
 fn strip_links_for_tts(text: &str) -> String {
     // 1. Markdown links [text](url) → text
@@ -227,7 +351,7 @@ async fn play_tts_chunked(
     app: AppHandle,
     text: String,
     openai: Arc<openai::OpenAIClient>,
-    tts_sink: Arc<Mutex<Option<rodio::Sink>>>,
+    _tts_sink: Arc<Mutex<Option<rodio::Sink>>>,
     _tts_stream_handle: Arc<Mutex<Option<rodio::OutputStreamHandle>>>,
     tts_active: Arc<Mutex<bool>>,
 ) {
@@ -524,8 +648,7 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
         return Err("No audio recorded".to_string());
     }
 
-    // Check if we're in prompt mode
-    let prompt_mode = state.prompt_mode.lock().unwrap().clone();
+    let (should_use_prompt, selected_model) = resolve_prompt_session(&state);
 
     // Load conversation history before spawning (inactivity check happens here)
     let conv_history = get_conversation_history(&state.database);
@@ -542,13 +665,21 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
     let openai_for_tts = state.openai_client.clone();
     let queue_dir = state.queue_dir.clone();
     let audio_data_for_queue = audio_data.clone();
+    let selected_model_for_queue = selected_model.clone();
+    let transcription_hints_for_queue = build_transcription_hints(&state.database);
     tokio::spawn(async move {
-        match openai.transcribe_audio(audio_data, 48000).await {
+        match openai.transcribe_audio(
+            audio_data,
+            48000,
+            transcription_hints_for_queue.0.as_deref(),
+            transcription_hints_for_queue.1.as_deref(),
+        ).await {
             Ok(transcribed_text) => {
                 println!("✨ Transcribed: {}", transcribed_text);
 
                 // Check if we're in prompt mode
-                if let Some(model) = prompt_mode {
+                if should_use_prompt {
+                    let model = selected_model_for_queue.clone();
                     println!("🤖 Prompt mode active with model: {}", model);
 
                     // Send transcribed text as prompt to GPT
@@ -666,8 +797,12 @@ async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle)
                 eprintln!("❌ Transcription error: {}", e);
                 let count = database.count_queue().unwrap_or(0);
                 if count < queue::MAX_QUEUE_SIZE {
-                    let mode = if prompt_mode.is_some() { "whisper-prompt" } else { "whisper-transcribe" };
-                    let model_name = prompt_mode.as_deref().unwrap_or("whisper");
+                    let mode = if should_use_prompt { "whisper-prompt" } else { "whisper-transcribe" };
+                    let model_name = if should_use_prompt {
+                        selected_model_for_queue.as_str()
+                    } else {
+                        "whisper"
+                    };
                     match queue::save_audio_to_wav(audio_data_for_queue, &queue_dir) {
                         Ok(wav_path) => {
                             let _ = database.enqueue_item(
@@ -715,6 +850,8 @@ fn copy_to_clipboard(app: AppHandle, text: String) -> Result<(), String> {
 #[tauri::command]
 fn set_use_realtime(state: State<'_, AppState>, use_realtime: bool) -> Result<(), String> {
     *state.use_realtime.lock().unwrap() = use_realtime;
+    state.database.save_setting("use_realtime", if use_realtime { "true" } else { "false" })
+        .map_err(|e| format!("Failed to save transcription mode: {}", e))?;
     println!("🔄 Switched to {} mode", if use_realtime { "Realtime" } else { "Whisper" });
     Ok(())
 }
@@ -754,9 +891,17 @@ fn get_selected_microphone(state: State<'_, AppState>) -> Result<Option<String>,
 
 #[tauri::command]
 fn set_selected_prompt_model(state: State<'_, AppState>, model: String, save_as_default: Option<bool>) -> Result<(), String> {
+    let model = normalize_prompt_model(&model);
+
     // Save as current session model
     state.database.save_setting("selected_prompt_model", &model)
         .map_err(|e| format!("Failed to save prompt model setting: {}", e))?;
+
+    *state.prompt_mode.lock().unwrap() = if model == "transcribe-only" {
+        None
+    } else {
+        Some(model.clone())
+    };
 
     // Only save as user_prompt_model (for Ctrl+Shift+Space) when explicitly requested
     // This prevents Ctrl+B or Ctrl+Alt+Space from overwriting the user's preferred model
@@ -772,8 +917,12 @@ fn set_selected_prompt_model(state: State<'_, AppState>, model: String, save_as_
 
 #[tauri::command]
 fn get_selected_prompt_model(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    state.database.load_setting("selected_prompt_model")
-        .map_err(|e| format!("Failed to load prompt model setting: {}", e))
+    Ok(Some(load_selected_prompt_model(&state.database)))
+}
+
+#[tauri::command]
+fn get_user_prompt_model(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(load_user_prompt_model(&state.database))
 }
 
 #[tauri::command]
@@ -793,6 +942,16 @@ fn get_current_recording_mode(state: State<'_, AppState>) -> Result<String, Stri
 
     println!("📋 get_current_recording_mode: prompt_mode={:?}, returning model={}", prompt_mode, model);
     Ok(model)
+}
+
+#[tauri::command]
+fn get_transcription_languages(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    Ok(load_transcription_languages(&state.database))
+}
+
+#[tauri::command]
+fn set_transcription_languages(state: State<'_, AppState>, languages: Vec<String>) -> Result<Vec<String>, String> {
+    save_transcription_languages(&state.database, languages)
 }
 
 // Removed start_pre_buffering - pre-buffering logic moved to audio capture
@@ -984,6 +1143,7 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
     let queue_dir_for_spawn = state.queue_dir.clone();
     let database_for_spawn = state.database.clone();
     let stop_handle_state = state.streaming_stop_handle.clone();
+    let realtime_transcription_hints = build_transcription_hints(&state.database);
 
     tokio::spawn(async move {
         // === 1. Start microphone FIRST (before WebSocket connect) ===
@@ -1075,7 +1235,10 @@ async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) ->
                 let connection_lost_for_audio = connection_lost.clone();
 
                 // Configure session
-                if let Err(e) = session.configure_transcription().await {
+                if let Err(e) = session.configure_transcription(
+                    realtime_transcription_hints.0.as_deref(),
+                    realtime_transcription_hints.1.as_deref(),
+                ).await {
                     eprintln!("❌ Failed to configure session: {}", e);
                     *is_recording_flag.lock().unwrap() = false;
                     if let Err(ue) = system_audio::unmute_system_audio() {
@@ -1441,7 +1604,7 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
     println!("📝 Transcript length: {} characters", transcript.len());
 
     // Check selected model in database FIRST (allows changing model during any recording)
-    let (should_use_prompt, selected_model) = {
+    let (_should_use_prompt, _selected_model) = {
         let mut pm = state.prompt_mode.lock().unwrap();
         let mode = pm.clone();
         println!("🔍 DEBUG: prompt_mode at start of stop_realtime_recording = {:?}", mode);
@@ -1468,6 +1631,8 @@ async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> 
         }
     };
 
+    let (should_use_prompt, selected_model) = resolve_prompt_session(&state);
+    let _realtime_stop_transcription_hints = build_transcription_hints(&state.database);
     println!("🎯 Final decision: should_use_prompt = {}, selected_model = '{}'", should_use_prompt, selected_model);
 
     if !transcript.is_empty() {
@@ -1756,7 +1921,15 @@ async fn process_single_queue_item(
         "whisper-transcribe" => {
             let path = item.audio_path.as_ref().ok_or("No audio path for whisper-transcribe item")?;
             let audio = queue::read_wav_to_f32(path)?;
-            let text = openai.transcribe_audio(audio, 48000).await?;
+            let transcription_hints = build_transcription_hints(database);
+            let text = openai
+                .transcribe_audio(
+                    audio,
+                    48000,
+                    transcription_hints.0.as_deref(),
+                    transcription_hints.1.as_deref(),
+                )
+                .await?;
             tlog!("Queue retry: whisper-transcribe succeeded for id={}", item.id);
             let ts = now_ms();
             let cost = estimate_cost_cents("whisper", None, &text);
@@ -1774,7 +1947,15 @@ async fn process_single_queue_item(
         "realtime-audio" => {
             let path = item.audio_path.as_ref().ok_or("No audio path for realtime-audio item")?;
             let (audio, sample_rate) = queue::read_wav_to_f32_with_rate(path)?;
-            let text = openai.transcribe_audio(audio, sample_rate).await?;
+            let transcription_hints = build_transcription_hints(database);
+            let text = openai
+                .transcribe_audio(
+                    audio,
+                    sample_rate,
+                    transcription_hints.0.as_deref(),
+                    transcription_hints.1.as_deref(),
+                )
+                .await?;
             tlog!("Queue retry: realtime-audio succeeded for id={}", item.id);
             let ts = now_ms();
             let cost = estimate_cost_cents("whisper", None, &text);
@@ -1921,6 +2102,10 @@ pub fn run() {
         .flatten()
         .map(|v| v == "true")
         .unwrap_or(false);
+    let use_realtime_default = parse_bool_setting(
+        database.load_setting("use_realtime").ok().flatten(),
+        DEFAULT_USE_REALTIME,
+    );
 
     // Initialize audio output stream for TTS
     // Leak the OutputStream so it lives for the app's lifetime (it's not Send, can't go in AppState)
@@ -1948,7 +2133,7 @@ pub fn run() {
         realtime_client: Arc::new(realtime::RealtimeClient::new(api_key)),
         database,
         is_recording: Arc::new(Mutex::new(false)),
-        use_realtime: Arc::new(Mutex::new(true)), // Default to Realtime API
+        use_realtime: Arc::new(Mutex::new(use_realtime_default)),
         prompt_mode: Arc::new(Mutex::new(None)),
         current_session_transcript: Arc::new(Mutex::new(String::new())),
         last_transcription: Arc::new(Mutex::new(None)),
@@ -2004,10 +2189,7 @@ pub fn run() {
                                 if !is_recording {
                                     // Ctrl+Shift+Space: use the user's chosen prompt model (separate key)
                                     // This is the model the user picked in the combo box for prompt sessions
-                                    let model = state.database.load_setting("user_prompt_model")
-                                        .ok()
-                                        .flatten()
-                                        .unwrap_or_else(|| "gpt-4o-mini".to_string());
+                                    let model = load_user_prompt_model(&state.database);
 
                                     // Save as current session model
                                     let _ = state.database.save_setting("selected_prompt_model", &model);
@@ -2122,19 +2304,10 @@ pub fn run() {
                                 let is_recording = *state.is_recording.lock().unwrap();
 
                                 if !is_recording {
-                                    // Check if prompt mode was already set by Ctrl+Shift+Space or Ctrl+Alt+Space
-                                    let current_prompt_mode = state.prompt_mode.lock().unwrap().clone();
-
-                                    // Determine which model to show in widget
-                                    let widget_model = if current_prompt_mode.is_none() {
-                                        println!("📝 Ctrl+Space starting - setting prompt mode to None (normal transcription)");
-                                        let _ = state.database.save_setting("selected_prompt_model", "transcribe-only");
-                                        *state.prompt_mode.lock().unwrap() = None;
-                                        "transcribe-only".to_string()
-                                    } else {
-                                        println!("⚠️ Ctrl+Space starting but prompt_mode already set to {:?} - keeping it", current_prompt_mode);
-                                        current_prompt_mode.clone().unwrap_or_else(|| "transcribe-only".to_string())
-                                    };
+                                    println!("📝 Ctrl+Space starting - forcing transcribe-only mode");
+                                    let _ = state.database.save_setting("selected_prompt_model", "transcribe-only");
+                                    *state.prompt_mode.lock().unwrap() = None;
+                                    let widget_model = "transcribe-only".to_string();
 
                                     // Starting recording - show widget
                                     if let Some(widget) = app.get_webview_window("recording-widget") {
@@ -2341,7 +2514,10 @@ pub fn run() {
             get_selected_microphone,
             set_selected_prompt_model,
             get_selected_prompt_model,
+            get_user_prompt_model,
             get_current_recording_mode,
+            get_transcription_languages,
+            set_transcription_languages,
             send_text_prompt,
             get_statistics,
             get_tts_enabled,
@@ -2443,7 +2619,7 @@ pub fn run() {
 
             println!("✅ Dicta is running!");
             println!("📌 Press Ctrl+Space to start/stop recording");
-            println!("📌 Press Ctrl+Shift+Space for GPT-4o-mini prompt mode");
+            println!("📌 Press Ctrl+Shift+Space for the saved prompt model");
             println!("📌 Press Ctrl+Alt+Space for GPT-4.1 prompt mode");
             println!("📌 Press Alt+Shift+Z to paste last transcription");
             println!("📌 Press Ctrl+B to open prompt input window");

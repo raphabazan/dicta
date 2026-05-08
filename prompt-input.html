@@ -329,7 +329,7 @@
     // Load saved model preference
     async function loadModel() {
       try {
-        const model = await invoke('get_selected_prompt_model');
+        const model = await invoke('get_user_prompt_model');
         if (model && (model === 'gpt-4.1' || model === 'gpt-4o-mini')) {
           modelSelect.value = model;
         } else {
@@ -348,7 +348,7 @@
 
       // Save model preference
       try {
-        await invoke('set_selected_prompt_model', { model });
+        await invoke('set_selected_prompt_model', { model, saveAsDefault: true });
       } catch (e) {}
 
       sendBtn.disabled = true;
@@ -424,7 +424,7 @@
     modelSelect.addEventListener('change', async () => {
       const model = modelSelect.value;
       try {
-        await invoke('set_selected_prompt_model', { model });
+        await invoke('set_selected_prompt_model', { model, saveAsDefault: true });
       } catch (e) {}
     });
 

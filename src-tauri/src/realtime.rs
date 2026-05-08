@@ -73,17 +73,35 @@ pub struct RealtimeSession {
 
 impl RealtimeSession {
     /// Configure the session for transcription-only mode
-    pub async fn configure_transcription(&self) -> Result<(), String> {
+    pub async fn configure_transcription(
+        &self,
+        language_hint: Option<&str>,
+        prompt_hint: Option<&str>,
+    ) -> Result<(), String> {
         println!("⚙️ Configuring transcription session...");
+
+        let transcription_config = if let Some(language) = language_hint {
+            json!({
+                "model": "whisper-1",
+                "language": language
+            })
+        } else if let Some(prompt) = prompt_hint {
+            json!({
+                "model": "whisper-1",
+                "prompt": prompt
+            })
+        } else {
+            json!({
+                "model": "whisper-1"
+            })
+        };
 
         let config = json!({
             "type": "session.update",
             "session": {
                 "modalities": ["text"], // Only text, no audio output
                 "input_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": "whisper-1"
-                },
+                "input_audio_transcription": transcription_config,
                 "turn_detection": {
                     "type": "server_vad",
                     "threshold": 0.5,

@@ -36,16 +36,21 @@ impl OpenAIClient {
     }
 
     /// Transcribe audio using Whisper API with confidence filtering
-    pub async fn transcribe_audio(&self, audio_data: Vec<f32>, sample_rate: u32) -> Result<String, String> {
+    pub async fn transcribe_audio(
+        &self,
+        audio_data: Vec<f32>,
+        sample_rate: u32,
+        language_hint: Option<&str>,
+        prompt_hint: Option<&str>,
+    ) -> Result<String, String> {
         println!("🔄 Transcribing audio... ({} samples at {}Hz)", audio_data.len(), sample_rate);
 
         // Convert f32 audio to WAV format
         let wav_data = self.audio_to_wav(audio_data, sample_rate)?;
 
-        // Call Whisper API with Portuguese language hint and verbose_json for word-level confidence
-        let form = reqwest::multipart::Form::new()
+        // Call Whisper API with optional language guidance and verbose_json for word-level confidence
+        let mut form = reqwest::multipart::Form::new()
             .text("model", "whisper-1")
-            .text("language", "pt")
             .text("response_format", "verbose_json")
             .text("timestamp_granularities[]", "word")
             .part(
@@ -55,6 +60,14 @@ impl OpenAIClient {
                     .mime_str("audio/wav")
                     .map_err(|e| format!("Failed to create multipart: {}", e))?,
             );
+
+        if let Some(language) = language_hint {
+            form = form.text("language", language.to_string());
+        }
+
+        if let Some(prompt) = prompt_hint {
+            form = form.text("prompt", prompt.to_string());
+        }
 
         let response = self
             .client
@@ -66,8 +79,9 @@ impl OpenAIClient {
             .map_err(|e| format!("Failed to send request: {}", e))?;
 
         if !response.status().is_success() {
+            let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            return Err(format!("API error: {}", error_text));
+            return Err(format!("API error ({}): {}", status, error_text));
         }
 
         let result: VerboseTranscriptionResponse = response
@@ -323,10 +337,25 @@ impl OpenAIClient {
         println!("🎵 Converting audio: {} samples @ {}Hz", audio_data.len(), sample_rate);
         println!("🎵 Duration: {:.2}s", audio_data.len() as f32 / sample_rate as f32);
 
-        // Keep original sample rate - Whisper handles various rates well
+        const TARGET_SAMPLE_RATE: u32 = 16_000;
+
+        let (audio_data, wav_sample_rate) = if sample_rate > TARGET_SAMPLE_RATE {
+            let resampled = self.resample_audio(&audio_data, sample_rate, TARGET_SAMPLE_RATE);
+            println!(
+                "Downsampled audio for upload: {}Hz -> {}Hz ({} -> {} samples)",
+                sample_rate,
+                TARGET_SAMPLE_RATE,
+                audio_data.len(),
+                resampled.len()
+            );
+            (resampled, TARGET_SAMPLE_RATE)
+        } else {
+            (audio_data, sample_rate)
+        };
+
         let spec = hound::WavSpec {
             channels: 1,
-            sample_rate,
+            sample_rate: wav_sample_rate,
             bits_per_sample: 16,
             sample_format: hound::SampleFormat::Int,
         };

@@ -27,6 +27,15 @@ interface PendingQueueItem {
   retry_count: number;
 }
 
+const transcriptionLanguageOptions = [
+  { code: "pt", label: "Português" },
+  { code: "en", label: "English" },
+  { code: "es", label: "Español" },
+  { code: "fr", label: "Français" },
+  { code: "de", label: "Deutsch" },
+  { code: "it", label: "Italiano" },
+];
+
 function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [status, setStatus] = useState("Ready");
@@ -34,7 +43,8 @@ function App() {
   const [availableMicrophones, setAvailableMicrophones] = useState<string[]>([]);
   const [selectedMicrophone, setSelectedMicrophone] = useState<string>("");
   const [transcriptionHistory, setTranscriptionHistory] = useState<TranscriptionEntry[]>([]);
-  const [useRealtimeAPI, setUseRealtimeAPI] = useState(true); // Toggle between Whisper and Realtime
+  const [useRealtimeAPI, setUseRealtimeAPI] = useState(false);
+  const [transcriptionLanguages, setTranscriptionLanguages] = useState<string[]>([]);
   const [currentTranscript, setCurrentTranscript] = useState(""); // Real-time transcript display
   const [statsData, setStatsData] = useState<StatsData | null>(null);
   const [statsRange, setStatsRange] = useState<"today" | "7days" | "month" | "year" | "all">("month");
@@ -194,6 +204,35 @@ function App() {
     }
   };
 
+  const loadTranscriptionPreferences = async () => {
+    try {
+      const [useRealtime, languages] = await Promise.all([
+        invoke<boolean>("get_use_realtime"),
+        invoke<string[]>("get_transcription_languages"),
+      ]);
+      setUseRealtimeAPI(useRealtime);
+      setTranscriptionLanguages(languages);
+    } catch (error) {
+      console.error("Failed to load transcription preferences:", error);
+    }
+  };
+
+  const toggleTranscriptionLanguage = async (language: string) => {
+    const nextLanguages = transcriptionLanguages.includes(language)
+      ? transcriptionLanguages.filter((value) => value !== language)
+      : [...transcriptionLanguages, language];
+
+    try {
+      const saved = await invoke<string[]>("set_transcription_languages", { languages: nextLanguages });
+      setTranscriptionLanguages(saved);
+      setStatus("Idiomas de transcrição atualizados");
+      setTimeout(() => setStatus("Ready"), 2000);
+    } catch (error) {
+      console.error("Failed to save transcription languages:", error);
+      setStatus("❌ Failed to update languages");
+    }
+  };
+
   const loadStats = async (range: typeof statsRange) => {
     const now = Date.now();
     const startOfToday = new Date();
@@ -247,6 +286,7 @@ function App() {
     // Load history and microphones on mount
     loadTranscriptionHistory();
     loadMicrophones();
+    loadTranscriptionPreferences();
     invoke<boolean>("get_tts_enabled").then((v) => setTtsEnabled(v)).catch(() => {});
     invoke<number>("get_queue_count").then((v) => setQueueCount(v)).catch(() => {});
 
@@ -923,6 +963,72 @@ function App() {
 
             {/* Microphone Selector */}
             <div className="space-y-4">
+              <div className="rounded-lg border border-gray-700 bg-gray-700/20 p-4 space-y-3">
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-medium text-white">Modo de transcrição</p>
+                    <p className="text-xs text-gray-400">
+                      A primeira abertura usa Whisper. Depois disso, o Dicta mantém o último modo salvo.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={async () => {
+                        setUseRealtimeAPI(false);
+                        await invoke("set_use_realtime", { useRealtime: false });
+                      }}
+                      disabled={isRecording}
+                      className={`px-3 py-1 rounded text-xs transition-colors ${
+                        !useRealtimeAPI
+                          ? "bg-blue-600 text-white"
+                          : "bg-gray-700 text-gray-300 hover:bg-gray-600"
+                      } ${isRecording ? "opacity-50 cursor-not-allowed" : ""}`}
+                    >
+                      Whisper
+                    </button>
+                    <button
+                      onClick={async () => {
+                        setUseRealtimeAPI(true);
+                        await invoke("set_use_realtime", { useRealtime: true });
+                      }}
+                      disabled={isRecording}
+                      className={`px-3 py-1 rounded text-xs transition-colors ${
+                        useRealtimeAPI
+                          ? "bg-blue-600 text-white"
+                          : "bg-gray-700 text-gray-300 hover:bg-gray-600"
+                      } ${isRecording ? "opacity-50 cursor-not-allowed" : ""}`}
+                    >
+                      Realtime
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-gray-700 bg-gray-700/20 p-4 space-y-3">
+                <div>
+                  <p className="text-sm font-medium text-white">Idiomas de transcrição</p>
+                  <p className="text-xs text-gray-400">
+                    Um idioma fixa a transcrição. Vários idiomas viram um hint multilíngue para ajudar em áudio misto.
+                  </p>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  {transcriptionLanguageOptions.map((option) => (
+                    <label
+                      key={option.code}
+                      className="flex items-center gap-2 rounded border border-gray-700 bg-gray-800/70 px-3 py-2 text-sm text-gray-200"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={transcriptionLanguages.includes(option.code)}
+                        onChange={() => toggleTranscriptionLanguage(option.code)}
+                        className="h-4 w-4 accent-blue-500"
+                      />
+                      <span>{option.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
               <div>
                 <label className="block text-sm text-gray-400 mb-2">
                   Microfone
