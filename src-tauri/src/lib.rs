@@ -14,6 +14,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use enigo::{Enigo, Key, Keyboard, Settings};
+#[cfg(target_os = "windows")]
+use windows::core::PWSTR;
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::CloseHandle;
+#[cfg(target_os = "windows")]
+use windows::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 fn ts() -> String {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
@@ -153,8 +163,9 @@ struct AppState {
 }
 
 const DEFAULT_USE_REALTIME: bool = false;
-const DEFAULT_PROMPT_MODEL: &str = "gpt-4.1";
+const DEFAULT_PROMPT_MODEL: &str = "gpt-5.4";
 const DEFAULT_TRANSCRIPTION_LANGUAGES: [&str; 2] = ["pt", "en"];
+const DEFAULT_GAME_MODE_ENABLED: bool = false;
 
 fn parse_bool_setting(value: Option<String>, default: bool) -> bool {
     value
@@ -164,7 +175,7 @@ fn parse_bool_setting(value: Option<String>, default: bool) -> bool {
 
 fn normalize_prompt_model(model: &str) -> String {
     match model {
-        "gpt-4.1" | "gpt-4o-mini" | "transcribe-only" => model.to_string(),
+        "gpt-5.4" | "gpt-4o-mini" | "transcribe-only" => model.to_string(),
         _ => "transcribe-only".to_string(),
     }
 }
@@ -234,6 +245,126 @@ fn save_transcription_languages(database: &db::Database, languages: Vec<String>)
         .save_setting("transcription_languages", &normalized.join(","))
         .map_err(|e| format!("Failed to save transcription languages: {}", e))?;
     Ok(normalized)
+}
+
+fn normalize_game_mode_processes(processes: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+
+    for process in processes {
+        let value = process.trim().to_lowercase();
+        if value.is_empty() {
+            continue;
+        }
+
+        if !normalized.iter().any(|existing| existing == &value) {
+            normalized.push(value);
+        }
+    }
+
+    normalized
+}
+
+fn load_game_mode_enabled(database: &db::Database) -> bool {
+    parse_bool_setting(
+        database.load_setting("game_mode_enabled").ok().flatten(),
+        DEFAULT_GAME_MODE_ENABLED,
+    )
+}
+
+fn load_game_mode_processes(database: &db::Database) -> Vec<String> {
+    let stored = database
+        .load_setting("game_mode_processes")
+        .ok()
+        .flatten()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|part| part.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    normalize_game_mode_processes(stored)
+}
+
+fn save_game_mode_processes(database: &db::Database, processes: Vec<String>) -> Result<Vec<String>, String> {
+    let normalized = normalize_game_mode_processes(processes);
+    database
+        .save_setting("game_mode_processes", &normalized.join(","))
+        .map_err(|e| format!("Failed to save game mode processes: {}", e))?;
+    Ok(normalized)
+}
+
+#[cfg(target_os = "windows")]
+fn get_foreground_process_info() -> Option<(String, String)> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return None;
+    }
+
+    let mut process_id = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+    }
+    if process_id == 0 {
+        return None;
+    }
+
+    let process_handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }.ok()?;
+    let mut buffer = vec![0u16; 1024];
+    let mut len = buffer.len() as u32;
+
+    let result = unsafe {
+        QueryFullProcessImageNameW(
+            process_handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+    };
+
+    let _ = unsafe { CloseHandle(process_handle) };
+    if result.is_err() {
+        return None;
+    }
+
+    let full_path = String::from_utf16_lossy(&buffer[..len as usize]).to_lowercase();
+    let process_name = PathBuf::from(&full_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_lowercase())?;
+
+    Some((process_name, full_path))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_foreground_process_info() -> Option<(String, String)> {
+    None
+}
+
+fn should_block_hotkeys_for_game_mode(database: &db::Database) -> bool {
+    if !load_game_mode_enabled(database) {
+        return false;
+    }
+
+    let Some((process_name, process_path)) = get_foreground_process_info() else {
+        return false;
+    };
+
+    let blocked_processes = load_game_mode_processes(database);
+    let is_steam_game = process_path.contains("steamapps\\common\\");
+    let is_blocked_process = blocked_processes.iter().any(|value| value == &process_name);
+
+    if is_steam_game || is_blocked_process {
+        tlog!(
+            "Game mode blocked hotkey for foreground process {} ({})",
+            process_name,
+            process_path
+        );
+        return true;
+    }
+
+    false
 }
 
 fn build_transcription_hints(database: &db::Database) -> (Option<String>, Option<String>) {
@@ -932,7 +1063,7 @@ fn get_current_recording_mode(state: State<'_, AppState>) -> Result<String, Stri
 
     let model = match prompt_mode.as_deref() {
         Some("gpt-4o-mini") => "gpt-4o-mini".to_string(),
-        Some("gpt-4.1") => "gpt-4.1".to_string(),
+        Some("gpt-5.4") => "gpt-5.4".to_string(),
         None => "transcribe-only".to_string(),
         Some(other) => {
             println!("⚠️ Unknown prompt mode: {}, defaulting to transcribe-only", other);
@@ -952,6 +1083,29 @@ fn get_transcription_languages(state: State<'_, AppState>) -> Result<Vec<String>
 #[tauri::command]
 fn set_transcription_languages(state: State<'_, AppState>, languages: Vec<String>) -> Result<Vec<String>, String> {
     save_transcription_languages(&state.database, languages)
+}
+
+#[tauri::command]
+fn get_game_mode_enabled(state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(load_game_mode_enabled(&state.database))
+}
+
+#[tauri::command]
+fn set_game_mode_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    state
+        .database
+        .save_setting("game_mode_enabled", if enabled { "true" } else { "false" })
+        .map_err(|e| format!("Failed to save game mode setting: {}", e))
+}
+
+#[tauri::command]
+fn get_game_mode_processes(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    Ok(load_game_mode_processes(&state.database))
+}
+
+#[tauri::command]
+fn set_game_mode_processes(state: State<'_, AppState>, processes: Vec<String>) -> Result<Vec<String>, String> {
+    save_game_mode_processes(&state.database, processes)
 }
 
 // Removed start_pre_buffering - pre-buffering logic moved to audio capture
@@ -1003,10 +1157,10 @@ fn estimate_cost_cents(model: &str, duration_ms: Option<i64>, text: &str) -> i64
             let tokens = text.len() as f64 / 4.0;
             (tokens * 0.60 / 1_000_000.0 * 10_000.0) as i64
         }
-        "gpt-4.1" => {
-            // ~$8/1M output tokens
+        "gpt-5.4" => {
+            // ~$15/1M output tokens
             let tokens = text.len() as f64 / 4.0;
-            (tokens * 8.0 / 1_000_000.0 * 10_000.0) as i64
+            (tokens * 15.0 / 1_000_000.0 * 10_000.0) as i64
         }
         _ => 0,
     }
@@ -2171,6 +2325,12 @@ pub fn run() {
                         return; // Ignore Released events
                     }
 
+                    if let Some(state) = app.try_state::<AppState>() {
+                        if should_block_hotkeys_for_game_mode(&state.database) {
+                            return;
+                        }
+                    }
+
                     // Check which shortcut was pressed
                     let shortcut_str = format!("{:?}", shortcut);
 
@@ -2235,22 +2395,22 @@ pub fn run() {
                             println!("⏭️ Ctrl+Shift+Space ignored (debounce)");
                         }
                     } else if shortcut_str.contains("Space") && shortcut_str.contains("CONTROL") && shortcut_str.contains("ALT") {
-                        // Ctrl+Alt+Space: Toggle recording with GPT-4o prompt mode
+                        // Ctrl+Alt+Space: Toggle recording with GPT-5.4 prompt mode
                         let mut last = last_recording_trigger_clone.lock().unwrap();
                         let now = Instant::now();
 
                         if now.duration_since(*last) > Duration::from_millis(100) {
                             *last = now;
-                            println!("🔥 Hotkey pressed: Ctrl+Alt+Space (GPT-4o mode)");
+                            println!("🔥 Hotkey pressed: Ctrl+Alt+Space (GPT-5.4 mode)");
 
                             if let Some(state) = app.try_state::<AppState>() {
                                 let is_recording = *state.is_recording.lock().unwrap();
 
                                 if !is_recording {
-                                    // Set prompt mode to gpt-4.1 and save to database
-                                    let _ = state.database.save_setting("selected_prompt_model", "gpt-4.1");
-                                    *state.prompt_mode.lock().unwrap() = Some("gpt-4.1".to_string());
-                                    println!("🤖 Prompt mode enabled: gpt-4.1 (saved to DB)");
+                                    // Set prompt mode to gpt-5.4 and save to database
+                                    let _ = state.database.save_setting("selected_prompt_model", "gpt-5.4");
+                                    *state.prompt_mode.lock().unwrap() = Some("gpt-5.4".to_string());
+                                    println!("🤖 Prompt mode enabled: gpt-5.4 (saved to DB)");
 
                                     // Show widget
                                     if let Some(widget) = app.get_webview_window("recording-widget") {
@@ -2269,12 +2429,12 @@ pub fn run() {
                                         }
                                         let _ = widget.show();
                                         // Tell widget which model is active
-                                        let _ = widget.emit("model-selected", "gpt-4.1".to_string());
+                                        let _ = widget.emit("model-selected", "gpt-5.4".to_string());
                                     }
                                 } else {
                                     // Stopping recording - DON'T clear prompt_mode here
                                     // It will be cleared in stop_realtime_recording after being used
-                                    println!("🛑 [Ctrl+Alt+Space] Stopping - prompt_mode (gpt-4.1) will be used in stop handler");
+                                    println!("🛑 [Ctrl+Alt+Space] Stopping - prompt_mode (gpt-5.4) will be used in stop handler");
 
                                     if let Some(widget) = app.get_webview_window("recording-widget") {
                                         let _ = widget.hide();
@@ -2518,6 +2678,10 @@ pub fn run() {
             get_current_recording_mode,
             get_transcription_languages,
             set_transcription_languages,
+            get_game_mode_enabled,
+            set_game_mode_enabled,
+            get_game_mode_processes,
+            set_game_mode_processes,
             send_text_prompt,
             get_statistics,
             get_tts_enabled,
@@ -2620,7 +2784,7 @@ pub fn run() {
             println!("✅ Dicta is running!");
             println!("📌 Press Ctrl+Space to start/stop recording");
             println!("📌 Press Ctrl+Shift+Space for the saved prompt model");
-            println!("📌 Press Ctrl+Alt+Space for GPT-4.1 prompt mode");
+            println!("📌 Press Ctrl+Alt+Space for GPT-5.4 prompt mode");
             println!("📌 Press Alt+Shift+Z to paste last transcription");
             println!("📌 Press Ctrl+B to open prompt input window");
             println!("📌 Press Ctrl+Alt+S to toggle TTS");

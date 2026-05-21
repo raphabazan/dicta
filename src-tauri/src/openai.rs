@@ -179,8 +179,8 @@ impl OpenAIClient {
         // Map model names to their correct identifiers
         let api_model = match model {
             "gpt-4o-mini" => "gpt-4o-mini",
-            "gpt-4o" => "gpt-4.1",
-            "gpt-4.1" => "gpt-4.1",
+            "gpt-4o" => "gpt-5.4",
+            "gpt-5.4" => "gpt-5.4",
             _ => model
         };
 

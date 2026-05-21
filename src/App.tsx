@@ -45,6 +45,8 @@ function App() {
   const [transcriptionHistory, setTranscriptionHistory] = useState<TranscriptionEntry[]>([]);
   const [useRealtimeAPI, setUseRealtimeAPI] = useState(false);
   const [transcriptionLanguages, setTranscriptionLanguages] = useState<string[]>([]);
+  const [gameModeEnabled, setGameModeEnabled] = useState(false);
+  const [gameModeProcessesText, setGameModeProcessesText] = useState("");
   const [currentTranscript, setCurrentTranscript] = useState(""); // Real-time transcript display
   const [statsData, setStatsData] = useState<StatsData | null>(null);
   const [statsRange, setStatsRange] = useState<"today" | "7days" | "month" | "year" | "all">("month");
@@ -206,12 +208,16 @@ function App() {
 
   const loadTranscriptionPreferences = async () => {
     try {
-      const [useRealtime, languages] = await Promise.all([
+      const [useRealtime, languages, gameMode, gameProcesses] = await Promise.all([
         invoke<boolean>("get_use_realtime"),
         invoke<string[]>("get_transcription_languages"),
+        invoke<boolean>("get_game_mode_enabled"),
+        invoke<string[]>("get_game_mode_processes"),
       ]);
       setUseRealtimeAPI(useRealtime);
       setTranscriptionLanguages(languages);
+      setGameModeEnabled(gameMode);
+      setGameModeProcessesText(gameProcesses.join(", "));
     } catch (error) {
       console.error("Failed to load transcription preferences:", error);
     }
@@ -230,6 +236,23 @@ function App() {
     } catch (error) {
       console.error("Failed to save transcription languages:", error);
       setStatus("❌ Failed to update languages");
+    }
+  };
+
+  const saveGameModeProcesses = async (rawValue: string) => {
+    const processes = rawValue
+      .split(",")
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean);
+
+    try {
+      const saved = await invoke<string[]>("set_game_mode_processes", { processes });
+      setGameModeProcessesText(saved.join(", "));
+      setStatus("Modo de jogo atualizado");
+      setTimeout(() => setStatus("Ready"), 2000);
+    } catch (error) {
+      console.error("Failed to save game mode processes:", error);
+      setStatus("❌ Failed to update game mode");
     }
   };
 
@@ -1026,6 +1049,48 @@ function App() {
                       <span>{option.label}</span>
                     </label>
                   ))}
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-gray-700 bg-gray-700/20 p-4 space-y-3">
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-medium text-white">Modo de jogo</p>
+                    <p className="text-xs text-gray-400">
+                      Quando ativado, os hotkeys do Dicta ficam bloqueados se um jogo da Steam estiver em foco
+                      ou se o executÃ¡vel ativo estiver na lista abaixo.
+                    </p>
+                  </div>
+                  <button
+                    onClick={async () => {
+                      const nextValue = !gameModeEnabled;
+                      setGameModeEnabled(nextValue);
+                      await invoke("set_game_mode_enabled", { enabled: nextValue });
+                    }}
+                    className={`px-3 py-1 rounded text-xs transition-colors ${
+                      gameModeEnabled
+                        ? "bg-green-600 text-white"
+                        : "bg-gray-700 text-gray-300 hover:bg-gray-600"
+                    }`}
+                  >
+                    {gameModeEnabled ? "ON" : "OFF"}
+                  </button>
+                </div>
+
+                <div>
+                  <label className="block text-sm text-gray-400 mb-2">
+                    Processos extras bloqueados
+                  </label>
+                  <input
+                    value={gameModeProcessesText}
+                    onChange={(e) => setGameModeProcessesText(e.target.value)}
+                    onBlur={() => saveGameModeProcesses(gameModeProcessesText)}
+                    placeholder="cs2.exe, valorant.exe"
+                    className="w-full px-4 py-2 bg-gray-700 text-white rounded border border-gray-600 focus:border-blue-500 focus:outline-none"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">
+                    Use nomes separados por vÃ­rgula. Jogos da Steam jÃ¡ sÃ£o bloqueados automaticamente pelo caminho do executÃ¡vel.
+                  </p>
                 </div>
               </div>
 
