@@ -1,0 +1,208 @@
+{
+  "scope": "Browser QA with synthetic development fixtures; no installed app or private history used",
+  "viewports": [
+    {
+      "bodyHeight": 600,
+      "bodyWidth": 800,
+      "horizontalOverflow": false,
+      "mainHeight": 491,
+      "name": "Início",
+      "outerOverflow": false,
+      "size": {
+        "height": 600,
+        "width": 800
+      }
+    },
+    {
+      "bodyHeight": 600,
+      "bodyWidth": 800,
+      "heading": "Histórico",
+      "horizontalOverflow": false,
+      "mainHeight": 491,
+      "name": "Histórico",
+      "outerOverflow": false,
+      "size": {
+        "height": 600,
+        "width": 800
+      }
+    },
+    {
+      "bodyHeight": 600,
+      "bodyWidth": 800,
+      "heading": "Fila",
+      "horizontalOverflow": false,
+      "mainHeight": 491,
+      "name": "Fila 2",
+      "outerOverflow": false,
+      "size": {
+        "height": 600,
+        "width": 800
+      }
+    },
+    {
+      "bodyHeight": 600,
+      "bodyWidth": 800,
+      "heading": "Uso e custos",
+      "horizontalOverflow": false,
+      "mainHeight": 491,
+      "name": "Uso",
+      "outerOverflow": false,
+      "size": {
+        "height": 600,
+        "width": 800
+      }
+    },
+    {
+      "bodyHeight": 600,
+      "bodyWidth": 800,
+      "heading": "Configurações",
+      "horizontalOverflow": false,
+      "mainHeight": 491,
+      "name": "Ajustes",
+      "outerOverflow": false,
+      "size": {
+        "height": 600,
+        "width": 800
+      }
+    },
+    {
+      "bodyHeight": 640,
+      "bodyWidth": 360,
+      "horizontalOverflow": false,
+      "mainHeight": 531.3333740234375,
+      "name": "Início",
+      "outerOverflow": false,
+      "size": {
+        "height": 640,
+        "width": 360
+      }
+    },
+    {
+      "bodyHeight": 640,
+      "bodyWidth": 360,
+      "heading": "Histórico",
+      "horizontalOverflow": false,
+      "mainHeight": 531.3333740234375,
+      "name": "Histórico",
+      "outerOverflow": false,
+      "size": {
+        "height": 640,
+        "width": 360
+      }
+    },
+    {
+      "bodyHeight": 640,
+      "bodyWidth": 360,
+      "heading": "Fila",
+      "horizontalOverflow": false,
+      "mainHeight": 531.3333740234375,
+      "name": "Fila 2",
+      "outerOverflow": false,
+      "size": {
+        "height": 640,
+        "width": 360
+      }
+    },
+    {
+      "bodyHeight": 640,
+      "bodyWidth": 360,
+      "heading": "Uso e custos",
+      "horizontalOverflow": false,
+      "mainHeight": 531.3333740234375,
+      "name": "Uso",
+      "outerOverflow": false,
+      "size": {
+        "height": 640,
+        "width": 360
+      }
+    },
+    {
+      "bodyHeight": 640,
+      "bodyWidth": 360,
+      "heading": "Configurações",
+      "horizontalOverflow": false,
+      "mainHeight": 531.3333740234375,
+      "name": "Ajustes",
+      "outerOverflow": false,
+      "size": {
+        "height": 640,
+        "width": 360
+      }
+    },
+    {
+      "bodyHeight": 800,
+      "bodyWidth": 1280,
+      "horizontalOverflow": false,
+      "mainHeight": 691,
+      "name": "Início",
+      "outerOverflow": false,
+      "size": {
+        "height": 800,
+        "width": 1280
+      }
+    },
+    {
+      "bodyHeight": 800,
+      "bodyWidth": 1280,
+      "heading": "Histórico",
+      "horizontalOverflow": false,
+      "mainHeight": 691,
+      "name": "Histórico",
+      "outerOverflow": false,
+      "size": {
+        "height": 800,
+        "width": 1280
+      }
+    },
+    {
+      "bodyHeight": 800,
+      "bodyWidth": 1280,
+      "heading": "Fila",
+      "horizontalOverflow": false,
+      "mainHeight": 691,
+      "name": "Fila 2",
+      "outerOverflow": false,
+      "size": {
+        "height": 800,
+        "width": 1280
+      }
+    },
+    {
+      "bodyHeight": 800,
+      "bodyWidth": 1280,
+      "heading": "Uso e custos",
+      "horizontalOverflow": false,
+      "mainHeight": 691,
+      "name": "Uso",
+      "outerOverflow": false,
+      "size": {
+        "height": 800,
+        "width": 1280
+      }
+    },
+    {
+      "bodyHeight": 800,
+      "bodyWidth": 1280,
+      "heading": "Configurações",
+      "horizontalOverflow": false,
+      "mainHeight": 691,
+      "name": "Ajustes",
+      "outerOverflow": false,
+      "size": {
+        "height": 800,
+        "width": 1280
+      }
+    }
+  ],
+  "interactions": {
+    "settingsTargetAndToggle": true,
+    "longHistoryExpansionAndCopy": true,
+    "historyPagination120Rows": true,
+    "emptyProfileStartStop": true,
+    "unknownStageNotShownAsFree": true
+  },
+  "limitations": [
+    "Native paste across applications and resume/hibernation remain pending",
+    "No accuracy corpus or invoice reconciliation"
+  ]
+}

@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await;
         results.push(match result{Ok(text)=>json!({"operation":"transcription","model":model,"elapsed_ms":start.elapsed().as_millis(),"text":text}),Err(error)=>json!({"operation":"transcription","model":model,"elapsed_ms":start.elapsed().as_millis(),"error":error})});
     }
-    for model in ["gpt-5.4", "gpt-6.1-sol"] {
+    for model in ["gpt-6-luna", "gpt-6.1-sol"] {
         let start = Instant::now();
         let result = client
             .send_prompt_options(

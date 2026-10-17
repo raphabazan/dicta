@@ -403,6 +403,7 @@ fn enqueue(
         let (samples, rate) = crate::queue::read_wav_to_f32_with_rate(&segment.path)?;
         let text = ctx
             .client
+            .for_source(&segment.session_id)
             .transcribe_with_model(
                 samples,
                 rate,
@@ -520,7 +521,8 @@ pub async fn run(
         .load_setting("selected_prompt_model")
         .ok()
         .flatten()
-        .filter(|s| ["gpt-5.4", "gpt-6.1-sol", "gpt-4o-mini"].contains(&s.as_str()));
+        .map(|s| crate::models::normalize(&s).to_string())
+        .filter(|s| s != "transcribe-only");
     ctx.database
         .set_session_config(
             &id,
@@ -635,7 +637,8 @@ async fn finalize(
         ctx.manager
             .update(&ctx.app, id, |s| s.phase = "processing_command".into());
         let history = crate::get_conversation_history(&ctx.database);
-        let request = ctx.client.send_prompt_options(
+        let client = ctx.client.for_source(id);
+        let request = client.send_prompt_options(
             &text,
             model,
             &history,

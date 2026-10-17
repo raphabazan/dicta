@@ -1,19 +1,127 @@
-import { sessionLabel, type SessionSnapshot } from "./session";
+import { duration } from "./format";
+import { sessionBusy, sessionLabel } from "./session";
+import { call } from "./desktop";
+import type { Dicta } from "./useDicta";
+import { commandModels } from "./types";
 
-export function SessionPanel({ session, onCopy }: { session: SessionSnapshot; onCopy: (text: string) => Promise<void> }) {
-  if (!session.id) return null;
-  const final = session.phase === "ready";
-  return <section aria-live="polite" aria-label="Sessão de ditado" className="rounded-lg border border-gray-700 bg-gray-900/40 p-4 space-y-3">
-    <div className="flex justify-between gap-4 text-sm">
-      <span>{sessionLabel(session)}</span>
-      <span className="text-gray-400">{Math.floor(session.duration_ms / 1000)} s · {session.completed}/{session.total} trechos</span>
-    </div>
-    {session.phase === "recording" && session.duration_ms >= 300000 && <p className="text-xs text-amber-300">Esta gravação será encerrada automaticamente aos 6 minutos.</p>}
-    {session.error && <p className="text-xs text-amber-300">{session.error.startsWith("API error") ? session.error : "O progresso disponível foi preservado. Confira as sessões na fila."}</p>}
-    {session.text && <>
-      <p className="text-xs text-gray-400">{final ? "Texto final" : "Prévia — pode mudar até a conclusão"}</p>
-      <p className="whitespace-pre-wrap break-words text-sm max-h-64 overflow-y-auto">{session.text}</p>
-      {final && <button className="rounded bg-blue-600 px-3 py-2 text-sm hover:bg-blue-500" onClick={() => void onCopy(session.text)}>Copiar texto completo</button>}
-    </>}
-  </section>;
+export function SessionPanel({ app }: { app: Dicta }) {
+  const { session, prefs, pending } = app;
+  const busy = sessionBusy(session);
+  const recording = session.phase === "recording";
+  const last = !session.id ? app.history[0] : null;
+  const text = session.text || last?.text || "";
+  const ready = session.phase === "ready" || Boolean(last);
+  return (
+    <section className="preview-panel" aria-label="Prévia do ditado">
+      <div className="preview-header">
+        <div className="row gap">
+          <span
+            className={`status-dot ${recording ? "recording" : busy ? "working" : ""}`}
+          />
+          <span role="status">{sessionLabel(session)}</span>
+        </div>
+        <span className="mono muted">
+          {duration(session.duration_ms || last?.duration_ms || 0)}
+        </span>
+      </div>
+      <div className="preview-body scroll-area" tabIndex={0}>
+        {text ? (
+          <>
+            <p className="eyebrow">
+              {last ? "Último texto" : ready ? "Texto final" : "Prévia"}
+            </p>
+            <p className="dictation-text">{text}</p>
+            {busy && (
+              <p className="caption muted preview-note">
+                O texto será reunido ao terminar.
+              </p>
+            )}
+          </>
+        ) : (
+          <div className="preview-empty">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <rect x="9" y="3" width="6" height="12" rx="3" />
+              <path d="M5 11a7 7 0 0 0 14 0M12 18v3M8 21h8" />
+            </svg>
+            <h1>{busy ? "Pode falar." : "Sua voz, em texto."}</h1>
+            <p>
+              {busy
+                ? "A prévia aparece quando os primeiros trechos ficarem prontos."
+                : "Comece um ditado. O texto aparece aqui enquanto você grava."}
+            </p>
+          </div>
+        )}
+        {session.duration_ms >= 300000 && recording && (
+          <p className="notice">A gravação será encerrada aos 6 minutos.</p>
+        )}
+        {session.error && (
+          <p className="notice">
+            O progresso disponível foi preservado. Confira a fila para
+            continuar.
+          </p>
+        )}
+      </div>
+      <div className="preview-controls">
+        <label className="mode-picker">
+          <span className="caption muted">Ao terminar</span>
+          <select
+            aria-label="Ação ao terminar"
+            value={prefs.selectedModel}
+            disabled={
+              !app.preferencesLoaded ||
+              (busy && !recording) ||
+              pending.has("model")
+            }
+            onChange={(e) => void app.selectModel(e.target.value)}
+          >
+            <option value="transcribe-only">Somente transcrever</option>
+            {commandModels.map((model) => (
+              <option key={model.value} value={model.value}>
+                {model.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="row gap control-actions">
+          {text && ready && (
+            <button
+              disabled={pending.has("copy")}
+              onClick={() => void app.copy(text)}
+            >
+              Copiar texto
+            </button>
+          )}
+          {recording && (
+            <button
+              className="quiet"
+              disabled={pending.has("record")}
+              onClick={() =>
+                void app.action("record", () => call("cancel_recording"))
+              }
+            >
+              Cancelar
+            </button>
+          )}
+          <button
+            className={`primary ${recording ? "stop" : ""}`}
+            disabled={
+              !app.preferencesLoaded ||
+              pending.has("record") ||
+              (busy && !recording)
+            }
+            onClick={() =>
+              void app.action("record", () =>
+                call(
+                  recording ? "stop_recording_audio" : "start_recording_audio",
+                ),
+              )
+            }
+          >
+            <span aria-hidden="true">{recording ? "■" : "●"}</span>{" "}
+            {recording ? "Concluir ditado" : busy ? "Processando…" : "Gravar"}
+          </button>
+        </div>
+      </div>
+    </section>
+  );
 }

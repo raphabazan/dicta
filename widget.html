@@ -197,14 +197,11 @@
     <div class="session-progress" id="sessionProgress" aria-live="polite">Gravando</div>
     <!-- Model selector (appears on hover) -->
     <div class="model-selector" id="modelSelector">
-      <button class="model-option" data-model="transcribe-only" title="Transcribe Only">
-        Transcribe Only
+      <button class="model-option" data-model="transcribe-only" title="Somente transcrever">
+        Só transcrever
       </button>
-      <button class="model-option" data-model="gpt-4o-mini" title="GPT-4o Mini">
-        GPT-4o-mini
-      </button>
-      <button class="model-option" data-model="gpt-5.4" title="GPT-5.4">
-        GPT-5.4
+      <button class="model-option" data-model="gpt-6-luna" title="GPT-6 Luna">
+        GPT-6 Luna
       </button>
       <button class="model-option" data-model="gpt-6.1-sol" title="GPT-6.1 Sol">GPT-6.1 Sol</button>
     </div>
@@ -249,7 +246,9 @@
       if (state === session) return;
       session = state;
       const label = document.getElementById('sessionProgress');
-      label.textContent = Math.floor(state.duration_ms / 1000) + ' s · ' + state.completed + '/' + state.total + ' trechos';
+      const seconds = Math.floor(state.duration_ms / 1000);
+      const time = Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0');
+      label.textContent = time + ' · ' + (state.phase === 'recording' ? 'Gravando' : state.phase === 'ready' ? 'Pronto' : 'Processando');
     }
     listen('session-state', event => receiveSession(event.payload))
       .then(() => invoke('get_session_state')).then(receiveSession).catch(() => {});

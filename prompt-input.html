@@ -226,9 +226,8 @@
       <div class="header-left" data-tauri-drag-region>
         <span class="title" data-tauri-drag-region>Prompt</span>
         <select class="model-select" id="modelSelect">
-          <option value="gpt-5.4">GPT-5.4</option>
           <option value="gpt-6.1-sol">GPT-6.1 Sol</option>
-          <option value="gpt-4o-mini">GPT-4o-mini</option>
+          <option value="gpt-6-luna">GPT-6 Luna</option>
         </select>
         <button class="btn-tts tts-off" id="ttsBtn" title="TTS OFF">
           <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -331,13 +330,13 @@
     async function loadModel() {
       try {
         const model = await invoke('get_user_prompt_model');
-        if (model && (model === 'gpt-5.4' || model === 'gpt-6.1-sol' || model === 'gpt-4o-mini')) {
+        if (model && (model === 'gpt-6.1-sol' || model === 'gpt-6-luna')) {
           modelSelect.value = model;
         } else {
-          modelSelect.value = 'gpt-5.4'; // default
+          modelSelect.value = 'gpt-6.1-sol';
         }
       } catch (e) {
-        modelSelect.value = 'gpt-5.4';
+        modelSelect.value = 'gpt-6.1-sol';
       }
     }
 

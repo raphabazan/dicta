@@ -2,13 +2,13 @@
 
 Aplicativo Windows de ditado com Tauri 2, Rust e React. O backend local captura áudio, persiste sessões em SQLite e chama a API OpenAI diretamente. Não há servidor próprio intermediário.
 
-Versão em desenvolvimento: **0.5.0**. A implementação e os testes automatizados estão locais. O aceite de colagem entre aplicativos, hibernação e qualidade de fala real continua pendente; consulte [o change OpenSpec](openspec/changes/review-dicta-reliability-and-streaming/tasks.md).
+Versão: **0.5.1**. A interface foi reorganizada para priorizar a prévia, com histórico e fila compactos. O aceite de colagem entre aplicativos, hibernação e qualidade de fala real continua pendente; consulte [o change OpenSpec](openspec/changes/review-dicta-reliability-and-streaming/tasks.md).
 
 ## Ditado
 
 Em Configurações, escolha o modelo de transcrição: Whisper ou GPT-Transcribe. O padrão permanece Whisper até a avaliação com fala real.
 
-A opção **Enviar trechos nas pausas enquanto gravo** é experimental e começa desligada. Quando ativada:
+A opção **Transcrever enquanto gravo** começa ativada em perfis sem essa preferência salva. Uma escolha anterior é preservada. Quando ativada:
 
 1. Após o alvo de 10, 20 ou 30 segundos, o Dicta procura uma pausa acústica de 300, 500 ou 700 ms.
 2. O trecho é salvo localmente e enviado, com até duas requisições simultâneas. A captura continua.
@@ -17,7 +17,7 @@ A opção **Enviar trechos nas pausas enquanto gravo** é experimental e começa
 
 Pausa acústica não garante fim de frase ou palavra. A reconciliação das bordas ainda exige avaliação com nomes, números e repetições reais. Com a opção desligada, a gravação inteira é enviada depois de parar. O limite de gravação é de seis minutos.
 
-Para comandos, estão disponíveis GPT-5.4, GPT-6.1 Sol e GPT-4o-mini. GPT-6.1 é um modelo de texto, separado do ASR. Busca na web é opcional e começa desligada. A rota Realtime antiga foi retirada; esta versão usa arquivos inteiros ou segmentos.
+Para comandos, estão disponíveis GPT-6.1 Sol e GPT-6 Luna. Preferências antigas de GPT-5.4/GPT-4o migram para Sol; GPT-4o-mini migra para Luna, inclusive em pendências. São modelos de texto, separados do ASR. Busca na web e modo de jogo começam ativados quando não há preferência salva. Uma escolha explícita anterior é preservada. A rota Realtime antiga foi retirada; esta versão usa arquivos inteiros ou segmentos.
 
 ## Atalhos
 
@@ -25,7 +25,7 @@ Para comandos, estão disponíveis GPT-5.4, GPT-6.1 Sol e GPT-4o-mini. GPT-6.1 �
 |---|---|
 | Ctrl+Espaço | Iniciar/parar ditado |
 | Ctrl+Shift+Espaço | Iniciar/parar com o modelo de comando salvo |
-| Ctrl+Alt+Espaço | Iniciar/parar com GPT-5.4 |
+| Ctrl+Alt+Espaço | Iniciar/parar com GPT-6.1 Sol |
 | Alt+Shift+Z | Tentar colar o último resultado salvo |
 | Ctrl+B | Abrir comando por texto/imagem |
 | Ctrl+Alt+S | Ativar/desativar leitura por voz |
@@ -40,6 +40,16 @@ Gravações, comandos e Alt+Shift+Z usam a mesma rotina serial de entrega. Ela a
 “Atalho enviado” significa que o Windows recebeu a sequência de entrada. O Dicta não consegue confirmar universalmente que outro aplicativo consumiu a colagem. Não há repetição automática de uma tentativa ambígua.
 
 Pendências aparecem na fila. **Recuperar** conclui o processamento e salva o texto, sem colá-lo automaticamente. Cancelar interrompe o processamento e preserva a sessão na fila; **Descartar** remove seu áudio pendente. Captura com perda de áudio é marcada como incompleta e exige revisão. A ação **Recuperar sessão e colagem** no tray interrompe recursos transitórios e invalida o destino antigo; não cola texto sozinha.
+
+## Interface e custos
+
+O início mostra a prévia e os controles de gravação. Histórico e fila usam linhas expansíveis. As preferências, os atalhos e a ajuda ficam em Ajustes. A janela ocupa a altura disponível; somente o conteúdo que precisa de mais espaço rola.
+
+**Uso** registra cada tentativa à API: transcrição, comandos e leitura por voz. Inclui tokens de entrada (com contexto/imagens), cache, gravações de cache, saída, busca, duração de áudio e caracteres de voz. Raciocínio já está incluído na saída e não é cobrado duas vezes. Tentativas e sobreposições de áudio são contabilizadas individualmente.
+
+Os valores são estimativas em USD pelas tarifas padrão de 17/10/2026, com precisão de bilionésimos no banco. A aplicação solicita processamento Standard. Chamadas canceladas, sem resposta ou com uso insuficiente ficam com custo desconhecido. Registros antigos não têm uso completo e não entram na soma nova. A fatura da OpenAI continua sendo a referência da cobrança.
+
+Fontes: [preços](https://developers.openai.com/api/docs/pricing), [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol), [GPT-6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna), [Whisper](https://developers.openai.com/api/docs/models/whisper-1), [GPT-Transcribe](https://developers.openai.com/api/docs/models/gpt-transcribe), [TTS](https://developers.openai.com/api/docs/models/tts-1).
 
 ## Desenvolvimento e testes
 
@@ -83,6 +93,6 @@ O SQLite contém o histórico e o conteúdo necessário para recuperar sessões;
 
 ## Atualização e rollback
 
-A CI de push/PR compila o frontend, executa testes e verifica Rust. Publicação continua separada. Antes de atualizar o instalado, concluir o [test-plan](openspec/changes/review-dicta-reliability-and-streaming/test-plan.md), encerrar o aplicativo e fazer backup do perfil completo. O schema novo é 4. Para voltar a 0.4.3, preservar o perfil 0.5 e restaurar a cópia anterior; não forçar downgrade do banco nem apagar pendências.
+A CI de push/PR compila o frontend, executa testes e verifica Rust. Publicação continua separada. Antes de atualizar o instalado, concluir o [test-plan](openspec/changes/review-dicta-reliability-and-streaming/test-plan.md), encerrar o aplicativo e fazer backup do perfil completo. O schema novo é 5. A atualização preserva histórico, configurações e pendências do schema 4. Para voltar a uma versão anterior, preservar o perfil atual e restaurar a cópia anterior; não forçar downgrade do banco nem apagar pendências.
 
 Testes que suspendam ou hibernem o computador são manuais e coordenados. Devem respeitar as instruções do host para encerrar o Docker com segurança antes da mudança de energia.

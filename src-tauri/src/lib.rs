@@ -5,10 +5,12 @@ mod delivery;
 mod diagnostics;
 mod dictation;
 mod lifecycle;
+mod models;
 pub mod openai;
 mod queue;
 pub mod segmentation;
 mod system_audio;
+mod usage;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -113,9 +115,9 @@ struct AppState {
     shortcut_errors: Arc<Mutex<Vec<String>>>,
 }
 
-const DEFAULT_PROMPT_MODEL: &str = "gpt-5.4";
+const DEFAULT_PROMPT_MODEL: &str = models::DEFAULT_COMMAND;
 const DEFAULT_TRANSCRIPTION_LANGUAGES: [&str; 2] = ["pt", "en"];
-const DEFAULT_GAME_MODE_ENABLED: bool = false;
+const DEFAULT_GAME_MODE_ENABLED: bool = true;
 
 fn parse_bool_setting(value: Option<String>, default: bool) -> bool {
     value
@@ -124,10 +126,7 @@ fn parse_bool_setting(value: Option<String>, default: bool) -> bool {
 }
 
 fn normalize_prompt_model(model: &str) -> String {
-    match model {
-        "gpt-5.4" | "gpt-6.1-sol" | "gpt-4o-mini" | "transcribe-only" => model.to_string(),
-        _ => "transcribe-only".to_string(),
-    }
+    models::normalize(model).to_string()
 }
 
 fn load_selected_prompt_model(database: &db::Database) -> String {
@@ -609,7 +608,7 @@ async fn start_recording_audio(
                 .load_setting("web_search_enabled")
                 .ok()
                 .flatten(),
-            false,
+            true,
         ),
         rate: 0,
         input_text: None,
@@ -683,7 +682,7 @@ async fn start_recording_audio(
                 tauri::async_runtime::spawn(play_tts_chunked(
                     ctx.app.clone(),
                     text,
-                    ctx.client.clone(),
+                    Arc::new(ctx.client.for_source(&id)),
                     tts.1,
                     tts.2,
                     tts.3,
@@ -770,7 +769,7 @@ fn get_web_search_enabled(state: State<'_, AppState>) -> bool {
             .load_setting("web_search_enabled")
             .ok()
             .flatten(),
-        false,
+        true,
     )
 }
 #[tauri::command]
@@ -929,6 +928,7 @@ fn get_selected_microphone(state: State<'_, AppState>) -> Result<Option<String>,
 #[tauri::command]
 fn set_selected_prompt_model(
     state: State<'_, AppState>,
+    app: AppHandle,
     model: String,
     save_as_default: Option<bool>,
 ) -> Result<(), String> {
@@ -963,6 +963,7 @@ fn set_selected_prompt_model(
             model
         );
     }
+    let _ = app.emit("model-selected", model);
     Ok(())
 }
 
@@ -981,19 +982,7 @@ fn get_current_recording_mode(state: State<'_, AppState>) -> Result<String, Stri
     // Return the model that should be pre-selected based on current prompt_mode
     let prompt_mode = state.prompt_mode.lock().unwrap().clone();
 
-    let model = match prompt_mode.as_deref() {
-        Some("gpt-4o-mini") => "gpt-4o-mini".to_string(),
-        Some("gpt-5.4") => "gpt-5.4".to_string(),
-        Some("gpt-6.1-sol") => "gpt-6.1-sol".to_string(),
-        None => "transcribe-only".to_string(),
-        Some(other) => {
-            println!(
-                "⚠️ Unknown prompt mode: {}, defaulting to transcribe-only",
-                other
-            );
-            "transcribe-only".to_string()
-        }
-    };
+    let model = normalize_prompt_model(prompt_mode.as_deref().unwrap_or("transcribe-only"));
 
     println!(
         "📋 get_current_recording_mode: prompt_mode={:?}, returning model={}",
@@ -1102,6 +1091,16 @@ fn compact_queue_error(error: &str) -> String {
 #[cfg(test)]
 mod regression_tests {
     #[test]
+    fn enabled_defaults_preserve_an_explicit_opt_out() {
+        let database = super::db::Database::new(":memory:".into()).unwrap();
+        assert!(super::load_game_mode_enabled(&database));
+        database.save_setting("game_mode_enabled", "false").unwrap();
+        assert!(!super::load_game_mode_enabled(&database));
+        assert!(crate::segmentation::SegmentConfig::default().enabled);
+        assert!(super::parse_bool_setting(None, true));
+        assert!(!super::parse_bool_setting(Some("false".into()), true));
+    }
+    #[test]
     fn queue_errors_are_unicode_safe_and_bounded() {
         for text in [
             format!("{}é final", "a".repeat(239)),
@@ -1129,35 +1128,6 @@ mod regression_tests {
         assert!(!super::should_disable_auto_retry(
             "API error (429): rate_limit_exceeded"
         ));
-    }
-}
-
-/// Estimate cost in hundredths of a cent based on model and usage
-fn estimate_cost_cents(model: &str, duration_ms: Option<i64>, text: &str) -> i64 {
-    match model {
-        "whisper" | "whisper-1" | "realtime" | "gpt-transcribe" => {
-            // $0.006/min of audio
-            let minutes = duration_ms.unwrap_or(0) as f64 / 60_000.0;
-            (minutes
-                * if model == "gpt-transcribe" {
-                    0.0045
-                } else {
-                    0.006
-                }
-                * 10_000.0) as i64
-        }
-        "gpt-4o-mini" => {
-            // ~$0.60/1M output tokens, ~4 chars/token
-            let tokens = text.len() as f64 / 4.0;
-            (tokens * 0.60 / 1_000_000.0 * 10_000.0) as i64
-        }
-        "gpt-5.4" | "gpt-6.1-sol" => {
-            // ~$15/1M output tokens
-            let tokens = text.len() as f64 / 4.0;
-            (tokens * if model == "gpt-6.1-sol" { 10.0 } else { 15.0 } / 1_000_000.0 * 10_000.0)
-                as i64
-        }
-        _ => 0,
     }
 }
 
@@ -1191,7 +1161,7 @@ async fn send_text_prompt(
                 .load_setting("web_search_enabled")
                 .ok()
                 .flatten(),
-            false,
+            true,
         ),
         rate: 16000,
         input_text: Some(prompt),
@@ -1231,7 +1201,7 @@ async fn send_text_prompt(
                 tauri::async_runtime::spawn(play_tts_chunked(
                     ctx.app.clone(),
                     text,
-                    ctx.client.clone(),
+                    Arc::new(ctx.client.for_source(&id)),
                     tts.1,
                     tts.2,
                     tts.3,
@@ -1252,6 +1222,18 @@ async fn get_statistics(
         .database
         .get_stats(from_ts, to_ts)
         .map_err(|e| format!("Failed to get stats: {}", e))
+}
+
+#[tauri::command]
+fn get_usage_summary(
+    state: State<'_, AppState>,
+    from_ts: i64,
+    to_ts: i64,
+) -> Result<usage::UsageSummary, String> {
+    state
+        .database
+        .usage_summary(from_ts, to_ts)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1446,6 +1428,7 @@ async fn process_single_queue_item(
         *last_transcription.lock().unwrap() = Some(text);
         return Ok(());
     }
+    let openai = openai.for_source(&format!("queue:{}", item.id));
     match item.mode.as_str() {
         "whisper-transcribe" => {
             let path = item
@@ -1724,7 +1707,9 @@ pub fn run() {
     let session_dir = app_data_dir.join("sessions");
     std::fs::create_dir_all(&session_dir).ok();
     let app_state = AppState {
-        openai_client: Arc::new(openai::OpenAIClient::new(api_key)),
+        openai_client: Arc::new(
+            openai::OpenAIClient::new(api_key).with_usage_store(database.clone()),
+        ),
         database,
         sessions: Arc::new(dictation::Manager::new()),
         session_dir,
@@ -1825,7 +1810,7 @@ pub fn run() {
                                         }
                                         let _ = widget.show();
                                         // Tell widget which model is active
-                                        let _ = widget.emit("model-selected", model.clone());
+                                        let _ = app.emit("model-selected", model.clone());
                                     }
                                 } else {
                                     // Stopping recording - DON'T clear prompt_mode here
@@ -1844,22 +1829,22 @@ pub fn run() {
                             println!("⏭️ Ctrl+Shift+Space ignored (debounce)");
                         }
                     } else if shortcut_str.contains("Space") && shortcut_str.contains("CONTROL") && shortcut_str.contains("ALT") {
-                        // Ctrl+Alt+Space: Toggle recording with GPT-5.4 prompt mode
+                        // Ctrl+Alt+Space: Toggle recording with GPT-6.1 Sol prompt mode
                         let mut last = last_recording_trigger_clone.lock().unwrap();
                         let now = Instant::now();
 
                         if now.duration_since(*last) > Duration::from_millis(100) {
                             *last = now;
-                            println!("🔥 Hotkey pressed: Ctrl+Alt+Space (GPT-5.4 mode)");
+                            println!("🔥 Hotkey pressed: Ctrl+Alt+Space (GPT-6.1 Sol mode)");
 
                             if let Some(state) = app.try_state::<AppState>() {
                                 let is_recording = *state.is_recording.lock().unwrap();
 
                                 if !is_recording {
-                                    // Set prompt mode to gpt-5.4 and save to database
-                                    let _ = state.database.save_setting("selected_prompt_model", "gpt-5.4");
-                                    *state.prompt_mode.lock().unwrap() = Some("gpt-5.4".to_string());
-                                    println!("🤖 Prompt mode enabled: gpt-5.4 (saved to DB)");
+                                    // Set prompt mode to gpt-6.1-sol and save to database
+                                    let _ = state.database.save_setting("selected_prompt_model", "gpt-6.1-sol");
+                                    *state.prompt_mode.lock().unwrap() = Some("gpt-6.1-sol".to_string());
+                                    println!("🤖 Prompt mode enabled: gpt-6.1-sol (saved to DB)");
 
                                     // Show widget
                                     if let Some(widget) = app.get_webview_window("recording-widget") {
@@ -1878,12 +1863,12 @@ pub fn run() {
                                         }
                                         let _ = widget.show();
                                         // Tell widget which model is active
-                                        let _ = widget.emit("model-selected", "gpt-5.4".to_string());
+                                        let _ = app.emit("model-selected", "gpt-6.1-sol".to_string());
                                     }
                                 } else {
                                     // Stopping recording - DON'T clear prompt_mode here
                                     // It will be cleared in stop_realtime_recording after being used
-                                    println!("🛑 [Ctrl+Alt+Space] Stopping - prompt_mode (gpt-5.4) will be used in stop handler");
+                                    println!("🛑 [Ctrl+Alt+Space] Stopping - prompt_mode (gpt-6.1-sol) will be used in stop handler");
 
                                     if let Some(widget) = app.get_webview_window("recording-widget") {
                                         let _ = widget.hide();
@@ -1934,7 +1919,7 @@ pub fn run() {
                                         }
                                         let _ = widget.show();
                                         // Tell widget which model is active
-                                        let _ = widget.emit("model-selected", widget_model);
+                                        let _ = app.emit("model-selected", widget_model);
                                     }
                                 } else {
                                     // Stopping recording with Ctrl+Space
@@ -2077,7 +2062,7 @@ pub fn run() {
             get_game_mode_processes,
             set_game_mode_processes,
             send_text_prompt,
-            get_statistics,
+            get_statistics, get_usage_summary,
             get_tts_enabled,
             set_tts_enabled,
             stop_tts_playback,
@@ -2190,7 +2175,7 @@ pub fn run() {
             println!("✅ Dicta is running!");
             println!("📌 Press Ctrl+Space to start/stop recording");
             println!("📌 Press Ctrl+Shift+Space for the saved prompt model");
-            println!("📌 Press Ctrl+Alt+Space for GPT-5.4 prompt mode");
+            println!("📌 Press Ctrl+Alt+Space for GPT-6.1 Sol prompt mode");
             println!("📌 Press Alt+Shift+Z to paste last transcription");
             println!("📌 Press Ctrl+B to open prompt input window");
             println!("📌 Press Ctrl+Alt+S to toggle TTS");

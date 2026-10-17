@@ -38,7 +38,7 @@ mod tests {
         let database = Database::new(file.clone()).unwrap();
         assert_eq!(
             database.load_setting("schema_version").unwrap().as_deref(),
-            Some("4")
+            Some("5")
         );
         assert_eq!(
             database.load_latest_transcription().unwrap().unwrap().text,
@@ -49,7 +49,7 @@ mod tests {
     }
     #[test]
     fn migrates_partial_legacy_schema_idempotently() {
-        for version in 0..=3 {
+        for version in 0..=4 {
             let file = path();
             let conn = Connection::open(&file).unwrap();
             conn.execute_batch("CREATE TABLE transcriptions(id INTEGER PRIMARY KEY,text TEXT NOT NULL,timestamp INTEGER NOT NULL,duration_ms INTEGER);CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);").unwrap();
@@ -88,7 +88,7 @@ mod tests {
             let database = Database::new(file.clone()).unwrap();
             assert_eq!(
                 database.load_setting("schema_version").unwrap().as_deref(),
-                Some("4")
+                Some("5")
             );
             drop(database);
             let again = Database::new(file.clone()).unwrap();
@@ -127,6 +127,44 @@ mod tests {
         assert_eq!(database.count_transcriptions().unwrap(), 1);
         assert_eq!(database.load_history_page(1, 0).unwrap().len(), 1);
         assert!(database.load_history_page(1, 1).unwrap().is_empty());
+    }
+    #[test]
+    fn usage_updates_one_attempt_and_preserves_unknown_charges_and_legacy_history() {
+        let database = Database::new(PathBuf::from(":memory:")).unwrap();
+        database
+            .save_transcription("antigo", 1, None, None, Some(99999), None)
+            .unwrap();
+        let mut row = crate::usage::record("whisper-1", "asr", 0, None, Some("session-1"));
+        database.record_usage(&row).unwrap();
+        row.status = 200;
+        row.provider_request_id = Some("req-test".into());
+        row = crate::usage::audio(row, 60_000);
+        database.record_usage(&row).unwrap();
+        database.record_usage(&row).unwrap();
+        let unknown = crate::usage::record("gpt-6-luna", "command", 0, None, Some("session-1"));
+        database.record_usage(&unknown).unwrap();
+        database
+            .save_result_once("session-1", "novo", None, "gpt-4o-mini", "prompt")
+            .unwrap();
+        let summary = database.usage_summary(0, i64::MAX).unwrap();
+        assert_eq!(summary.requests, 2);
+        assert_eq!(summary.unknown_requests, 1);
+        assert_eq!(summary.cost_nanos, 6_000_000);
+        assert_eq!(summary.legacy_entries, 1);
+        assert!(summary
+            .recent
+            .iter()
+            .any(|r| r.provider_request_id.as_deref() == Some("req-test")));
+        assert_eq!(
+            database
+                .load_latest_transcription()
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("gpt-6-luna")
+        );
+        assert_eq!(database.usage_summary(0, 1).unwrap().requests, 0);
     }
     #[test]
     fn startup_preserves_unfinished_sessions_without_delivery() {
@@ -240,6 +278,19 @@ pub struct Database {
 }
 
 impl Database {
+    pub fn record_usage(&self, row: &crate::usage::UsageRecord) -> Result<()> {
+        self.conn.lock().unwrap().execute("INSERT INTO api_usage(request_id,source_id,timestamp,stage,model,status,input_tokens,cached_tokens,cache_write_tokens,output_tokens,reasoning_tokens,audio_ms,characters,search_calls,cost_nanos,basis,price_version,provider_request_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18) ON CONFLICT(request_id) DO UPDATE SET status=excluded.status,input_tokens=excluded.input_tokens,cached_tokens=excluded.cached_tokens,cache_write_tokens=excluded.cache_write_tokens,output_tokens=excluded.output_tokens,reasoning_tokens=excluded.reasoning_tokens,audio_ms=excluded.audio_ms,characters=excluded.characters,search_calls=excluded.search_calls,cost_nanos=excluded.cost_nanos,basis=excluded.basis,provider_request_id=excluded.provider_request_id",rusqlite::params![row.request_id,row.source_id,row.timestamp,row.stage,row.model,row.status,row.input_tokens,row.cached_tokens,row.cache_write_tokens,row.output_tokens,row.reasoning_tokens,row.audio_ms,row.characters,row.search_calls,row.cost_nanos,row.basis,row.price_version,row.provider_request_id])?;
+        Ok(())
+    }
+    pub fn usage_summary(&self, from: i64, to: i64) -> Result<crate::usage::UsageSummary> {
+        use crate::usage::{UsageRecord, UsageStage, UsageSummary};
+        let conn = self.conn.lock().unwrap();
+        let mut summary = conn.query_row("SELECT COUNT(*),COALESCE(SUM(status<200 OR status>=300),0),COALESCE(SUM(cost_nanos IS NULL),0),COALESCE(SUM(input_tokens),0),COALESCE(SUM(cached_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(audio_ms),0),COALESCE(SUM(characters),0),COALESCE(SUM(search_calls),0),COALESCE(SUM(cost_nanos),0) FROM api_usage WHERE timestamp BETWEEN ?1 AND ?2",rusqlite::params![from,to],|r|Ok(UsageSummary{requests:r.get(0)?,failed_requests:r.get(1)?,unknown_requests:r.get(2)?,input_tokens:r.get(3)?,cached_tokens:r.get(4)?,output_tokens:r.get(5)?,audio_ms:r.get(6)?,characters:r.get(7)?,search_calls:r.get(8)?,cost_nanos:r.get(9)?,..UsageSummary::default()}))?;
+        summary.legacy_entries=conn.query_row("SELECT COUNT(*) FROM transcriptions t WHERE timestamp BETWEEN ?1 AND ?2 AND NOT EXISTS(SELECT 1 FROM api_usage u WHERE u.source_id=t.source_id)",rusqlite::params![from,to],|r|r.get(0))?;
+        summary.by_stage=conn.prepare("SELECT stage,COUNT(*),COALESCE(SUM(cost_nanos),0),COALESCE(SUM(cost_nanos IS NULL),0) FROM api_usage WHERE timestamp BETWEEN ?1 AND ?2 GROUP BY stage ORDER BY stage")?.query_map(rusqlite::params![from,to],|r|Ok(UsageStage{stage:r.get(0)?,requests:r.get(1)?,cost_nanos:r.get(2)?,unknown_requests:r.get(3)?}))?.collect::<Result<Vec<_>>>()?;
+        summary.recent=conn.prepare("SELECT request_id,source_id,timestamp,stage,model,status,input_tokens,cached_tokens,cache_write_tokens,output_tokens,reasoning_tokens,audio_ms,characters,search_calls,cost_nanos,basis,price_version,provider_request_id FROM api_usage WHERE timestamp BETWEEN ?1 AND ?2 ORDER BY timestamp DESC LIMIT 100")?.query_map(rusqlite::params![from,to],|r|Ok(UsageRecord{request_id:r.get(0)?,source_id:r.get(1)?,timestamp:r.get(2)?,stage:r.get(3)?,model:r.get(4)?,status:r.get(5)?,input_tokens:r.get(6)?,cached_tokens:r.get(7)?,cache_write_tokens:r.get(8)?,output_tokens:r.get(9)?,reasoning_tokens:r.get(10)?,audio_ms:r.get(11)?,characters:r.get(12)?,search_calls:r.get(13)?,cost_nanos:r.get(14)?,basis:r.get(15)?,price_version:r.get(16)?,provider_request_id:r.get(17)?}))?.collect::<Result<Vec<_>>>()?;
+        Ok(summary)
+    }
     /// Initialize database with schema
     pub fn new(db_path: PathBuf) -> Result<Self> {
         let mut connection = Connection::open(db_path)?;
@@ -370,6 +421,15 @@ impl Database {
             INSERT OR REPLACE INTO settings(key,value) VALUES ('schema_version','4');")?;
         ensure_column(&conn, "conversation_history", "source_id", "TEXT")?;
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_source ON conversation_history(source_id,role) WHERE source_id IS NOT NULL",[])?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS api_usage (
+            request_id TEXT PRIMARY KEY, provider_request_id TEXT, source_id TEXT, timestamp INTEGER NOT NULL, stage TEXT NOT NULL,
+            model TEXT NOT NULL, status INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_tokens INTEGER NOT NULL,
+            cache_write_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL, reasoning_tokens INTEGER NOT NULL,
+            audio_ms INTEGER NOT NULL, characters INTEGER NOT NULL, search_calls INTEGER NOT NULL,
+            cost_nanos INTEGER, basis TEXT NOT NULL, price_version TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON api_usage(timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_usage_source ON api_usage(source_id);
+            INSERT OR REPLACE INTO settings(key,value) VALUES ('schema_version','5');")?;
         conn.commit()?;
 
         Ok(Self {
@@ -748,7 +808,13 @@ impl Database {
         model: &str,
         mode: &str,
     ) -> Result<()> {
-        let cost = crate::estimate_cost_cents(model, duration, text);
+        let model = if mode == "prompt" {
+            crate::models::normalize(model)
+        } else {
+            model
+        };
+        // New results use the per-request ledger. Do not invent tokens from output text.
+        let cost: Option<i64> = None;
         self.conn.lock().unwrap().execute("INSERT OR IGNORE INTO transcriptions(text,timestamp,duration_ms,model,mode,source_id,cost_cents) VALUES (?1,?2,?3,?4,?5,?6,?7)",rusqlite::params![text,crate::now_ms(),duration,model,mode,source,cost])?;
         Ok(())
     }

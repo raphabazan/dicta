@@ -54,7 +54,7 @@
 - [x] 5.1 Exibir fase real, segmentos pendentes, preview separado do final e texto completo pronto para copiar/colar.
 - [x] 5.2 Remover listeners de colagem legados e sincronizar frontend por snapshot/eventos versionados do backend. Atalhos de gravação e stop do widget chamam o backend diretamente.
 - [x] 5.3 Separar componentes e módulos tocados, sem uma refatoração global paralela ao ajuste Windows.
-- [ ] 5.4 Paginar histórico e registrar uso/custo real quando disponível, rotulando estimativas.
+- [x] 5.4 Paginar histórico e registrar uso/custo real quando disponível, rotulando estimativas.
 - [x] 5.5 Revisar dependências e remover ferramentas de ícones dispensáveis; atualizar em grupos com build e smoke. Vulnerabilidades restantes do toolchain Tailwind 3 documentadas; sem migração forçada de major.
 - [ ] 5.6 Revisar Credential Manager, CSP/capacidades e logs privados conforme os fluxos efetivamente necessários.
 - [x] 5.7 Criar CI em push/PR com build, testes de contrato e lint proporcional; manter publicação separada.
@@ -72,3 +72,16 @@ Checkboxes de implementação não equivalem a aceite operacional. O modo segmen
 - 5.6: CSP definida e logs sem payload; credenciais continuam no mecanismo existente de ambiente/.env. Credential Manager pendente.
 - No fechamento da implementação local ainda não havia instalação, commit, push ou publicação. O perfil de produção permanece separado do debug.
 - Posteriormente, Rapha autorizou explicitamente o push e a release 0.5.0 para realizar os testes operacionais por conta própria. Essa autorização permite publicar antes da matriz manual; as tarefas de aceite operacional permanecem abertas.
+
+## Interface e contabilidade — 0.5.1
+
+- [x] Prévia no topo, shell limitado ao viewport e rolagem dentro do conteúdo.
+- [x] Histórico e fila compactos, com expansão de textos longos e paginação do histórico.
+- [x] Preferências e ajuda em Ajustes; revisão de português e redução do contador técnico do widget.
+- [x] GPT-6.1 Sol e GPT-6 Luna como seleções ativas, com normalização dos modelos anteriores.
+- [x] Padrões de trechos, busca e modo de jogo ativados quando não há escolha anterior salva.
+- [x] Ledger por tentativa, sem payload, schema 5 e estimativas a partir do uso retornado pela API; custos desconhecidos e históricos antigos separados.
+- [x] Smoke real dos dois modelos de comando com validação de uso e custo; sem corpus de qualidade ou verificação da fatura.
+- [x] QA das cinco telas em 800×600, 360×640 e 1280×800, expansão/cópia de texto longo, paginação e preferências com fixtures de desenvolvimento.
+
+Rapha confirmou que o envio nas pausas funcionou bem após ativar a opção. A lógica dos cortes foi preservada nesta entrega; mudou apenas o padrão para configurações ausentes. As observações de 0.5.0 acima são históricas. O aceite nativo de colagem/hibernação e o corpus de qualidade continuam abertos.

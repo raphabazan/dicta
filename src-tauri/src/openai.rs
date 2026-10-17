@@ -1,9 +1,12 @@
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
+#[derive(Clone)]
 pub struct OpenAIClient {
     api_key: String,
     client: reqwest::Client,
+    usage_store: Option<std::sync::Arc<crate::db::Database>>,
+    source_id: Option<String>,
 }
 
 pub fn api_error(status: u16, value: &Value) -> String {
@@ -61,12 +64,38 @@ impl OpenAIClient {
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
+            usage_store: None,
+            source_id: None,
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(90))
                 .build()
                 .expect("HTTP client initialization"),
         }
+    }
+    pub(crate) fn with_usage_store(mut self, store: std::sync::Arc<crate::db::Database>) -> Self {
+        self.usage_store = Some(store);
+        self
+    }
+    pub(crate) fn for_source(&self, source: &str) -> Self {
+        Self {
+            source_id: Some(source.into()),
+            ..self.clone()
+        }
+    }
+    fn persist_usage(&self, row: &crate::usage::UsageRecord) -> Result<(), String> {
+        if let Some(store) = &self.usage_store {
+            store
+                .record_usage(row)
+                .map_err(|_| "usage_storage".to_string())?;
+        }
+        Ok(())
+    }
+    fn begin_usage(&self, model: &str, stage: &str) -> Result<crate::usage::UsageRecord, String> {
+        let row = crate::usage::record(model, stage, 0, None, self.source_id.as_deref());
+        // Persist before sending. Cancellation or timeout remains an unknown charge.
+        self.persist_usage(&row)?;
+        Ok(row)
     }
     pub async fn transcribe_audio(
         &self,
@@ -93,6 +122,7 @@ impl OpenAIClient {
         if rate == 0 || audio.is_empty() {
             return Err("empty_audio".into());
         }
+        let duration_ms = (audio.len() as u64 * 1000 / rate as u64) as i64;
         let wav = self.audio_to_wav(audio, rate)?;
         if wav.len() > 25_000_000 {
             return Err("audio_too_large".into());
@@ -119,6 +149,9 @@ impl OpenAIClient {
             if let Some(hint) = hint {
                 form = form.text("prompt", hint.to_string());
             }
+            let mut usage = self.begin_usage(model, "asr")?;
+            usage.audio_ms = duration_ms;
+            self.persist_usage(&usage)?;
             let response = self
                 .client
                 .post("https://api.openai.com/v1/audio/transcriptions")
@@ -139,10 +172,14 @@ impl OpenAIClient {
                 .get("x-request-id")
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
+            usage.status = status;
+            usage.provider_request_id = request_id.clone();
+            self.persist_usage(&usage)?;
             let value: Value = response
                 .json()
                 .await
                 .map_err(|_| "api_invalid_json".to_string())?;
+            self.persist_usage(&crate::usage::audio(usage, duration_ms))?;
             crate::diagnostics::event(
                 "asr_request",
                 json!({"model":model,"attempt":attempt,"status":status,"request_id":request_id,"elapsed_ms":start.elapsed().as_millis()}),
@@ -176,8 +213,8 @@ impl OpenAIClient {
         image: Option<&str>,
         web_search: bool,
     ) -> Result<String, String> {
-        let model = if model == "gpt-4o" { "gpt-5.4" } else { model };
-        if !["gpt-5.4", "gpt-6.1-sol", "gpt-4o-mini"].contains(&model) {
+        let model = crate::models::normalize(model);
+        if model == "transcribe-only" {
             return Err("unsupported_prompt_model".into());
         }
         let mut input: Vec<Value> = history
@@ -195,14 +232,14 @@ impl OpenAIClient {
             input.push(json!({"role":"user","content":prompt}));
         }
         let mut body = json!({"model":model,"store":false,"instructions":"You are a helpful assistant. When asked to write, rewrite, translate, or improve a message, email, or text, respond with ONLY the final text. For questions, answer normally. Never use markdown formatting or em dashes.","input":input});
-        if model == "gpt-6.1-sol" {
-            body["reasoning"] = json!({"effort":"low"});
-        }
+        body["service_tier"] = json!("default");
+        body["reasoning"] = json!({"effort":"low"});
         if web_search {
             body["tools"] = json!([{"type":"web_search"}]);
             body["tool_choice"] = json!("auto");
         }
         let start = Instant::now();
+        let mut usage = self.begin_usage(model, "command")?;
         // No blind command retry: an ambiguous response may already have incurred work.
         let response = self
             .client
@@ -224,10 +261,14 @@ impl OpenAIClient {
             .get("x-request-id")
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
+        usage.status = status;
+        usage.provider_request_id = request_id.clone();
+        self.persist_usage(&usage)?;
         let value: Value = response
             .json()
             .await
             .map_err(|_| "api_invalid_json".to_string())?;
+        self.persist_usage(&crate::usage::response(usage, &value))?;
         crate::diagnostics::event(
             "prompt_request",
             json!({"model":model,"status":status,"request_id":request_id,"elapsed_ms":start.elapsed().as_millis(),"input_tokens":value["usage"]["input_tokens"],"output_tokens":value["usage"]["output_tokens"]}),
@@ -247,6 +288,9 @@ impl OpenAIClient {
             "response_format": "mp3"
         });
 
+        let mut usage = self.begin_usage("tts-1", "tts")?;
+        usage.characters = text.chars().count() as i64;
+        self.persist_usage(&usage)?;
         let response = self
             .client
             .post("https://api.openai.com/v1/audio/speech")
@@ -255,7 +299,15 @@ impl OpenAIClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("TTS request failed: {}", e))?;
+            .map_err(|_| "tts_connection".to_string())?;
+
+        usage.status = response.status().as_u16();
+        usage.provider_request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        self.persist_usage(&crate::usage::speech(usage, text))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -427,6 +479,31 @@ pub fn split_into_tts_chunks(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "Sends two small, paid synthetic commands using the configured API key"]
+    async fn live_command_models_record_provider_usage() {
+        if std::env::var("OPENAI_API_KEY").is_err() {
+            let directory = dirs::data_local_dir().unwrap();
+            dotenv::from_path(directory.join("com.dicta.app/.env")).ok();
+        }
+        let store = std::sync::Arc::new(crate::db::Database::new(":memory:".into()).unwrap());
+        let client =
+            OpenAIClient::new(std::env::var("OPENAI_API_KEY").expect("API key unavailable"))
+                .with_usage_store(store.clone())
+                .for_source("synthetic-model-smoke");
+        for model in ["gpt-6-luna", "gpt-6.1-sol"] {
+            let text = client
+                .send_prompt_options("Responda apenas: Teste concluído.", model, &[], None, false)
+                .await
+                .unwrap();
+            assert!(!text.is_empty());
+        }
+        let summary = store.usage_summary(0, i64::MAX).unwrap();
+        println!("{}", serde_json::to_string(&summary).unwrap());
+        assert_eq!(summary.requests, 2);
+        assert!(summary.input_tokens > 0 && summary.output_tokens > 0);
+        assert_eq!(summary.unknown_requests, 0);
+    }
     #[test]
     fn text_without_words_keeps_punctuation() {
         assert_eq!(

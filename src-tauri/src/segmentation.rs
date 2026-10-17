@@ -10,7 +10,7 @@ pub struct SegmentConfig {
 impl Default for SegmentConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             target_seconds: 20,
             silence_ms: 500,
         }
@@ -223,7 +223,13 @@ mod tests {
     }
     #[test]
     fn whole_file_mode_does_not_send_early() {
-        let mut s = Segmenter::new(1000, SegmentConfig::default());
+        let mut s = Segmenter::new(
+            1000,
+            SegmentConfig {
+                enabled: false,
+                ..SegmentConfig::default()
+            },
+        );
         assert!(s.push(&vec![0.1; 60_000]).is_empty());
         assert_eq!(s.finish().unwrap().samples.len(), 60_000);
     }
