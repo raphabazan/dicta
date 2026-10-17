@@ -13,7 +13,7 @@
 
     body {
       width: 155px;
-      height: 120px;
+      height: 200px;
       overflow: hidden; /* Remove scrollbars */
       background: transparent;
       font-family: system-ui, -apple-system, sans-serif;
@@ -140,10 +140,12 @@
       border-radius: 2px;
     }
 
+    .session-progress { position: absolute; bottom: 46px; left: 0; width: 155px; text-align: center; color: #d1d5db; font-size: 11px; background: rgba(17,24,39,.9); padding: 4px 0; border-radius: 5px; }
+
     /* Model selector combo box */
     .model-selector {
       position: absolute;
-      top: -110px;
+      top: -140px;
       left: 0;
       width: 155px;
       background: rgba(17, 24, 39, 0.95);
@@ -192,6 +194,7 @@
 </head>
 <body>
   <div class="widget" id="widget">
+    <div class="session-progress" id="sessionProgress" aria-live="polite">Gravando</div>
     <!-- Model selector (appears on hover) -->
     <div class="model-selector" id="modelSelector">
       <button class="model-option" data-model="transcribe-only" title="Transcribe Only">
@@ -203,6 +206,7 @@
       <button class="model-option" data-model="gpt-5.4" title="GPT-5.4">
         GPT-5.4
       </button>
+      <button class="model-option" data-model="gpt-6.1-sol" title="GPT-6.1 Sol">GPT-6.1 Sol</button>
     </div>
 
     <button class="btn btn-cancel" id="cancelBtn" title="Cancel">
@@ -229,6 +233,7 @@
     import { invoke } from '@tauri-apps/api/core';
     import { emit, listen } from '@tauri-apps/api/event';
     import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
+    import { initialSession, reconcileSession } from './src/session';
 
     const cancelBtn = document.getElementById('cancelBtn');
     const stopBtn = document.getElementById('stopBtn');
@@ -237,6 +242,17 @@
     const widget = document.getElementById('widget');
     const currentWindow = getCurrentWebviewWindow();
     const modelOptions = document.querySelectorAll('.model-option');
+
+    let session = initialSession;
+    function receiveSession(next) {
+      const state = reconcileSession(session, next);
+      if (state === session) return;
+      session = state;
+      const label = document.getElementById('sessionProgress');
+      label.textContent = Math.floor(state.duration_ms / 1000) + ' s · ' + state.completed + '/' + state.total + ' trechos';
+    }
+    listen('session-state', event => receiveSession(event.payload))
+      .then(() => invoke('get_session_state')).then(receiveSession).catch(() => {});
 
     // TTS state
     let ttsEnabled = false;
@@ -348,7 +364,7 @@
 
     stopBtn.addEventListener('click', async () => {
       try {
-        await emit('widget-stop-recording');
+        await invoke('stop_recording_audio');
         await currentWindow.hide();
       } catch (error) {
         console.error('Failed to stop:', error);

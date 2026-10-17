@@ -1,0 +1,43 @@
+{
+  "captured_at": "2026-10-17T13:08:12.860Z",
+  "probe": "GET model metadata only; no audio or text inference",
+  "results": [
+    {
+      "model": "whisper-1",
+      "status": 200,
+      "elapsed_ms": 1923,
+      "returned_id": "whisper-1"
+    },
+    {
+      "model": "gpt-5.4",
+      "status": 200,
+      "elapsed_ms": 1231,
+      "returned_id": "gpt-5.4"
+    },
+    {
+      "model": "gpt-6.1-sol",
+      "status": 200,
+      "elapsed_ms": 1394,
+      "returned_id": "gpt-6.1-sol"
+    },
+    {
+      "model": "gpt-transcribe",
+      "status": 200,
+      "elapsed_ms": 699,
+      "returned_id": "gpt-transcribe"
+    },
+    {
+      "model": "gpt-live-transcribe",
+      "status": 200,
+      "elapsed_ms": 798,
+      "returned_id": "gpt-live-transcribe"
+    },
+    {
+      "model": "gpt-4o-realtime-preview-2024-12-17",
+      "status": 404,
+      "elapsed_ms": 1649,
+      "error_code": "model_not_found",
+      "error_type": "invalid_request_error"
+    }
+  ]
+}

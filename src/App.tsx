@@ -1,3 +1,6 @@
+import { TranscriptionSettings } from "./TranscriptionSettings";
+import { SessionPanel } from "./SessionPanel";
+import { initialSession, reconcileSession, sessionBusy, sessionLabel, deliveryMessage, type SessionSnapshot, type SegmentConfig, type RecoverySession } from "./session";
 import { useState, useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
@@ -6,6 +9,7 @@ import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
 interface TranscriptionEntry {
+  id: number;
   text: string;
   timestamp: number;
 }
@@ -25,6 +29,8 @@ interface PendingQueueItem {
   model: string;
   created_at: number;
   retry_count: number;
+  last_error: string | null;
+  auto_retry_disabled: boolean;
 }
 
 const transcriptionLanguageOptions = [
@@ -43,16 +49,28 @@ function App() {
   const [availableMicrophones, setAvailableMicrophones] = useState<string[]>([]);
   const [selectedMicrophone, setSelectedMicrophone] = useState<string>("");
   const [transcriptionHistory, setTranscriptionHistory] = useState<TranscriptionEntry[]>([]);
-  const [useRealtimeAPI, setUseRealtimeAPI] = useState(false);
+  const historyLoadingRef = useRef(false);
+  const historyGenerationRef = useRef(0);
+  const [historyHasMore, setHistoryHasMore] = useState(true);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [shortcutErrors, setShortcutErrors] = useState<string[]>([]);
+  const [segmentConfig, setSegmentConfig] = useState<SegmentConfig>({ enabled: false, target_seconds: 20, silence_ms: 500 });
+  const [asrModel, setAsrModel] = useState("whisper-1");
+  const [session, setSession] = useState<SessionSnapshot>(initialSession);
+  const sessionRef = useRef(initialSession);
+  const [recoverySessions, setRecoverySessions] = useState<RecoverySession[]>([]);
+  const [buildId, setBuildId] = useState("");
+  const [webSearch, setWebSearch] = useState(false);
   const [transcriptionLanguages, setTranscriptionLanguages] = useState<string[]>([]);
   const [gameModeEnabled, setGameModeEnabled] = useState(false);
   const [gameModeProcessesText, setGameModeProcessesText] = useState("");
-  const [currentTranscript, setCurrentTranscript] = useState(""); // Real-time transcript display
+
   const [statsData, setStatsData] = useState<StatsData | null>(null);
   const [statsRange, setStatsRange] = useState<"today" | "7days" | "month" | "year" | "all">("month");
   const [showStatsDetails, setShowStatsDetails] = useState(false);
   const [ttsEnabled, setTtsEnabled] = useState(false);
   const [queueCount, setQueueCount] = useState(0);
+  const pendingCount = queueCount + recoverySessions.length;
   const [queueRetrying, setQueueRetrying] = useState(false);
   const [queueItems, setQueueItems] = useState<PendingQueueItem[]>([]);
   const [updateAvailable, setUpdateAvailable] = useState(false);
@@ -60,98 +78,13 @@ function App() {
   const [isUpdating, setIsUpdating] = useState(false);
   const [updateProgress, setUpdateProgress] = useState("");
 
-  // Refs to always have current values inside event listener closures
-  const isRecordingRef = useRef(false);
-  const isStartingRef = useRef(false);
-  const isStoppingRef = useRef(false);
-
-  const startRecording = async () => {
-    if (isStartingRef.current || isRecordingRef.current || isStoppingRef.current) {
-      console.log(`⏭️ Blocked: starting=${isStartingRef.current} recording=${isRecordingRef.current} stopping=${isStoppingRef.current}`);
-      return;
-    }
-
-    try {
-      isStartingRef.current = true;
-      setCurrentTranscript(""); // Reset transcript
-
-      // Play start sound and wait for it to finish before backend mutes system audio
-      playStartSound();
-      await new Promise(resolve => setTimeout(resolve, 200));
-
-      // Query backend for current mode (source of truth)
-      const useRealtime = await invoke<boolean>("get_use_realtime");
-      console.log(`🎯 Backend mode: ${useRealtime ? 'Realtime' : 'Whisper'}`);
-
-      if (useRealtime) {
-        await invoke("start_realtime_recording");
-        setStatus("🎤 Recording (Realtime)...");
-      } else {
-        await invoke("start_recording_audio");
-        setStatus("🎤 Recording (Whisper)...");
-      }
-
-      isRecordingRef.current = true;
-      setIsRecording(true);
-      console.log(`🔴 Recording started (${useRealtime ? 'Realtime' : 'Whisper'})`);
-    } catch (error) {
-      console.error("Failed to start recording:", error);
-      setStatus("Error starting recording");
-      isRecordingRef.current = false;
-    } finally {
-      isStartingRef.current = false;
-    }
-  };
-
-  const stopRecording = async () => {
-    console.log(`🛑 stopRecording called (stopping=${isStoppingRef.current}, recording=${isRecordingRef.current})`);
-
-    if (isStoppingRef.current || !isRecordingRef.current) {
-      console.log("⏭️ Blocked: already stopping or not recording");
-      return;
-    }
-
-    try {
-      isStoppingRef.current = true;
-      setStatus("⏳ Processing...");
-
-      // Play stop sound
-      playStopSound();
-
-      // Query backend for current mode (source of truth)
-      const useRealtime = await invoke<boolean>("get_use_realtime");
-      console.log(`🎯 Backend mode for stop: ${useRealtime ? 'Realtime' : 'Whisper'}`);
-
-      if (useRealtime) {
-        console.log("📞 Calling stop_realtime_recording...");
-        await invoke("stop_realtime_recording");
-        console.log("✅ stop_realtime_recording returned");
-      } else {
-        console.log("📞 Calling stop_recording_audio...");
-        await invoke("stop_recording_audio");
-        console.log("✅ stop_recording_audio returned");
-      }
-
-      isRecordingRef.current = false;
-      setIsRecording(false);
-      setStatus("Ready");
-      console.log("⚪ Recording stopped");
-      // Refresh history after recording
-      loadTranscriptionHistory();
-    } catch (error) {
-      console.error("Failed to stop recording:", error);
-      setStatus("Error stopping recording");
-      isRecordingRef.current = false;
-      setIsRecording(false);
-    } finally {
-      isStoppingRef.current = false;
-    }
-  };
-
   const loadTranscriptionHistory = async () => {
+    const generation = ++historyGenerationRef.current;
     try {
       const history = await invoke<TranscriptionEntry[]>("get_transcription_history");
+      if (generation !== historyGenerationRef.current) return;
       setTranscriptionHistory(history); // Already ordered by backend (most recent first)
+      setHistoryHasMore(history.length === 100);
     } catch (error) {
       console.error("Failed to load history:", error);
     }
@@ -208,18 +141,25 @@ function App() {
 
   const loadTranscriptionPreferences = async () => {
     try {
-      const [useRealtime, languages, gameMode, gameProcesses] = await Promise.all([
-        invoke<boolean>("get_use_realtime"),
+      const [config, languages, gameMode, gameProcesses, asr, build, search, shortcuts] = await Promise.all([
+        invoke<SegmentConfig>("get_segment_config"),
         invoke<string[]>("get_transcription_languages"),
         invoke<boolean>("get_game_mode_enabled"),
         invoke<string[]>("get_game_mode_processes"),
+        invoke<string>("get_asr_model"),
+        invoke<string>("get_build_info"),
+        invoke<boolean>("get_web_search_enabled"),
+        invoke<string[]>("get_shortcut_errors"),
       ]);
-      setUseRealtimeAPI(useRealtime);
+      setSegmentConfig(config);
+      setAsrModel(asr);
+      setBuildId(build);
+      setWebSearch(search);
+      setShortcutErrors(shortcuts);
       setTranscriptionLanguages(languages);
       setGameModeEnabled(gameMode);
       setGameModeProcessesText(gameProcesses.join(", "));
     } catch (error) {
-      console.error("Failed to load transcription preferences:", error);
     }
   };
 
@@ -234,7 +174,6 @@ function App() {
       setStatus("Idiomas de transcrição atualizados");
       setTimeout(() => setStatus("Ready"), 2000);
     } catch (error) {
-      console.error("Failed to save transcription languages:", error);
       setStatus("❌ Failed to update languages");
     }
   };
@@ -254,6 +193,42 @@ function App() {
       console.error("Failed to save game mode processes:", error);
       setStatus("❌ Failed to update game mode");
     }
+  };
+
+  const saveSegmentConfig = async (config: SegmentConfig) => {
+    try { await invoke("set_segment_config", { config }); setSegmentConfig(config); }
+    catch (error) { setStatus(String(error)); }
+  };
+  const saveAsrModel = async (model: string) => {
+    try { await invoke("set_asr_model", { model }); setAsrModel(model); }
+    catch (error) { setStatus(String(error)); }
+  };
+  const recoverSession = async (id: string) => {
+    try { await invoke("retry_session", { id }); }
+    catch (error) { setStatus(String(error)); }
+    finally { setRecoverySessions(await invoke<RecoverySession[]>("get_recoverable_sessions")); }
+  };
+  const discardSession = async (id: string) => {
+    if (!window.confirm("Descartar o áudio ou comando pendente desta sessão?")) return;
+    try { await invoke("discard_session", { id }); setRecoverySessions(await invoke<RecoverySession[]>("get_recoverable_sessions")); }
+    catch (error) { setStatus(String(error)); }
+  };
+  const loadMoreHistory = async () => {
+    if (historyLoadingRef.current || !historyHasMore) return;
+    historyLoadingRef.current = true;
+    setHistoryLoading(true);
+    const generation = historyGenerationRef.current;
+    try {
+      const page = await invoke<TranscriptionEntry[]>("get_transcription_history", { limit: 100, offset: transcriptionHistory.length });
+      if (generation !== historyGenerationRef.current) return;
+      setTranscriptionHistory(previous => {
+        const seen = new Set(previous.map(entry => entry.id));
+        return [...previous, ...page.filter(entry => !seen.has(entry.id))];
+      });
+      setHistoryHasMore(page.length === 100);
+    }
+    catch (error) { setStatus(String(error)); }
+    finally { historyLoadingRef.current = false; setHistoryLoading(false); }
   };
 
   const loadStats = async (range: typeof statsRange) => {
@@ -329,43 +304,13 @@ function App() {
   useEffect(() => {
     console.log("🎧 Setting up event listeners");
 
-    // Listen for hotkey events - uses refs to avoid stale closure values
-    const unlistenHotkey = listen("toggle-recording", async () => {
-      console.log(`✅ Hotkey event received (recording=${isRecordingRef.current}, stopping=${isStoppingRef.current}, starting=${isStartingRef.current})`);
-
-      if (isRecordingRef.current) {
-        console.log("➡️ Calling stopRecording()");
-        await stopRecording();
-      } else if (!isStoppingRef.current) {
-        console.log("➡️ Calling startRecording()");
-        await startRecording();
-      } else {
-        console.log("⏭️ Hotkey ignored: stop in progress");
-      }
-    });
-
-    // Listen for widget stop event
-    const unlistenWidgetStop = listen("widget-stop-recording", async () => {
-      console.log("🛑 Widget stop event received");
-      await stopRecording();
-    });
+    const unlistenStartSound = listen("recording-sound-start", playStartSound);
+    const unlistenStopSound = listen("recording-sound-stop", playStopSound);
 
     // Listen for widget cancel event
     const unlistenWidgetCancel = listen("recording-cancelled", async () => {
       console.log("❌ Widget cancel event received");
       playCancelSound();
-      isRecordingRef.current = false;
-      isStartingRef.current = false;
-      isStoppingRef.current = false;
-      setIsRecording(false);
-      setStatus("Cancelled");
-      setTimeout(() => setStatus("Ready"), 2000);
-    });
-
-    // Listen for auto-stop event (6 minute limit)
-    const unlistenAutoStop = listen("auto-stop-recording", async () => {
-      console.log("⏰ Auto-stop event received (6 minute limit)");
-      await stopRecording();
     });
 
     // Listen for history updates
@@ -374,48 +319,27 @@ function App() {
       await loadTranscriptionHistory();
     });
 
-    // Listen for realtime transcription deltas
-    const unlistenDelta = listen<string>("transcription-delta", (event) => {
-      console.log("📝 Delta received:", event.payload);
-      setCurrentTranscript((prev) => prev + event.payload);
-    });
-
-    // Listen for transcription completion
-    const unlistenTranscription = listen<string>("transcription-complete", async (event) => {
-      const text = event.payload;
-      console.log("📋 Transcription complete:", text);
-
-      try {
-        // 1. Save current clipboard content
-        let originalClipboard = "";
-        try {
-          originalClipboard = await navigator.clipboard.readText();
-          console.log("💾 Saved original clipboard");
-        } catch (e) {
-          console.warn("Could not read clipboard:", e);
-        }
-
-        // 2. Put transcribed text in clipboard
-        await navigator.clipboard.writeText(text);
-        console.log("📋 Transcription in clipboard");
-
-        // 3. Try to paste automatically (simulate Ctrl+V)
-        // This works by briefly focusing a hidden input, pasting, then restoring focus
-        setStatus("✅ Pasted! (Press Alt+Shift+Z if paste failed)");
-
-        // 4. Restore original clipboard after a short delay
-        setTimeout(async () => {
-          if (originalClipboard) {
-            await navigator.clipboard.writeText(originalClipboard);
-            console.log("♻️ Restored original clipboard");
-          }
-          setStatus("Ready");
-        }, 1000);
-
-      } catch (error) {
-        console.error("Auto-paste failed:", error);
-        setStatus("❌ Failed - Press Alt+Shift+Z to paste");
-      }
+    let disposed = false;
+    const receiveSession = (next: SessionSnapshot) => {
+      if (disposed) return;
+      const accepted = reconcileSession(sessionRef.current, next);
+      if (accepted === sessionRef.current) return;
+      sessionRef.current = accepted;
+      setSession(accepted);
+      const recording = accepted.phase === "recording";
+      setIsRecording(recording);
+      setStatus(sessionLabel(accepted));
+    };
+    const unlistenSession = listen<SessionSnapshot>("session-state", event => receiveSession(event.payload));
+    // Register before requesting the snapshot; sequence/generation reject late replies.
+    void unlistenSession.then(() => invoke<SessionSnapshot>("get_session_state")).then(receiveSession).catch(() => {});
+    const unlistenDelivery = listen<{status:string;code:string}>("delivery-result", event => setStatus(deliveryMessage(event.payload.code)));
+    const refreshRecovery = () => invoke<RecoverySession[]>("get_recoverable_sessions").then(items => { if (!disposed) setRecoverySessions(items); }).catch(() => {});
+    void refreshRecovery();
+    const unlistenSessions = listen("sessions-updated", refreshRecovery);
+    const unlistenResumed = listen("runtime-resumed", () => {
+      void invoke<SessionSnapshot>("get_session_state").then(receiveSession).catch(() => {});
+      void refreshRecovery();
     });
 
     // Listen for response-ready (play notification sound)
@@ -426,13 +350,11 @@ function App() {
 
     // Listen for TTS toggle events (from Ctrl+Alt+S hotkey)
     const unlistenTts = listen<boolean>("tts-toggled", (event) => {
-      console.log("🔊 TTS toggled:", event.payload);
       setTtsEnabled(event.payload);
     });
 
     // Listen for queue events
     const unlistenQueueUpdated = listen<number>("queue-updated", (event) => {
-      console.log("📋 Queue updated:", event.payload);
       setQueueCount(event.payload);
       invoke<PendingQueueItem[]>("get_queue_items")
         .then(items => setQueueItems(items))
@@ -451,32 +373,26 @@ function App() {
     });
 
     // Listen for offline recording (no internet, mic still recording locally)
-    const unlistenRecordingOffline = listen<string>("recording-offline", (event) => {
-      console.warn("📡 Recording offline:", event.payload);
+    const unlistenRecordingOffline = listen<string>("recording-offline", () => {
       setStatus("Sem conexão — gravando localmente");
     });
 
     // Listen for recording errors (connection drops, API failures)
     const unlistenRecordingError = listen<string>("recording-error", (event) => {
-      console.error("❌ Recording error:", event.payload);
-      isRecordingRef.current = false;
-      isStartingRef.current = false;
-      isStoppingRef.current = false;
-      setIsRecording(false);
+      void invoke<SessionSnapshot>("get_session_state").then(receiveSession).catch(() => {});
       setStatus(`Erro: ${event.payload}`);
-      setCurrentTranscript("");
-      playCancelSound();
-      setTimeout(() => setStatus("Ready"), 5000);
     });
 
     return () => {
-      unlistenHotkey.then((fn) => fn());
-      unlistenWidgetStop.then((fn) => fn());
+      unlistenStartSound.then(fn => fn());
+      unlistenStopSound.then(fn => fn());
       unlistenWidgetCancel.then((fn) => fn());
-      unlistenAutoStop.then((fn) => fn());
       unlistenHistory.then((fn) => fn());
-      unlistenDelta.then((fn) => fn());
-      unlistenTranscription.then((fn) => fn());
+      disposed = true;
+      unlistenSession.then(fn => fn());
+      unlistenDelivery.then(fn => fn());
+      unlistenSessions.then(fn => fn());
+      unlistenResumed.then(fn => fn());
       unlistenResponse.then((fn) => fn());
       unlistenTts.then((fn) => fn());
       unlistenQueueUpdated.then((fn) => fn());
@@ -511,6 +427,23 @@ function App() {
         minute: "2-digit"
       });
     }
+  };
+
+  const formatQueueError = (error: string | null) => {
+    if (!error) return null;
+
+    const lower = error.toLowerCase();
+    if (lower.includes("insufficient_quota")) {
+      return "OpenAI sem quota ou sem billing disponível para essa chave.";
+    }
+    if (lower.includes("invalid_api_key") || lower.includes("incorrect api key")) {
+      return "A chave da OpenAI parece inválida.";
+    }
+    if (lower.includes("account_deactivated")) {
+      return "A conta da OpenAI usada pelo app está desativada.";
+    }
+
+    return error;
   };
 
   const applyUpdate = async () => {
@@ -601,7 +534,7 @@ function App() {
                 : "text-gray-400 hover:bg-gray-700"
             }`}
           >
-            Fila{queueCount > 0 ? ` (${queueCount})` : ""}
+            Fila{pendingCount > 0 ? ` (${pendingCount})` : ""}
           </button>
           <button
             onClick={() => setCurrentView("stats")}
@@ -628,40 +561,7 @@ function App() {
         {currentView === "home" ? (
           <>
             <div className="bg-gray-800 rounded-lg p-6 space-y-4">
-              {/* API Toggle */}
-              <div className="flex items-center justify-between border-b border-gray-700 pb-4">
-                <span className="text-sm text-gray-400">Transcription API:</span>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={async () => {
-                      setUseRealtimeAPI(false);
-                      await invoke("set_use_realtime", { useRealtime: false });
-                    }}
-                    disabled={isRecording}
-                    className={`px-3 py-1 rounded text-xs transition-colors ${
-                      !useRealtimeAPI
-                        ? "bg-blue-600 text-white"
-                        : "bg-gray-700 text-gray-300 hover:bg-gray-600"
-                    } ${isRecording ? "opacity-50 cursor-not-allowed" : ""}`}
-                  >
-                    Whisper
-                  </button>
-                  <button
-                    onClick={async () => {
-                      setUseRealtimeAPI(true);
-                      await invoke("set_use_realtime", { useRealtime: true });
-                    }}
-                    disabled={isRecording}
-                    className={`px-3 py-1 rounded text-xs transition-colors ${
-                      useRealtimeAPI
-                        ? "bg-blue-600 text-white"
-                        : "bg-gray-700 text-gray-300 hover:bg-gray-600"
-                    } ${isRecording ? "opacity-50 cursor-not-allowed" : ""}`}
-                  >
-                    Realtime ⚡
-                  </button>
-                </div>
-              </div>
+              <TranscriptionSettings config={segmentConfig} model={asrModel} disabled={sessionBusy(session)} onConfig={saveSegmentConfig} onModel={saveAsrModel} />
 
               {/* TTS Toggle */}
               <div className="flex items-center justify-between border-b border-gray-700 pb-4">
@@ -683,10 +583,10 @@ function App() {
               </div>
 
               {/* Offline Queue Indicator */}
-              {queueCount > 0 && (
+              {pendingCount > 0 && (
                 <div className="flex items-center justify-between border-b border-gray-700 pb-4">
                   <span className="text-sm text-yellow-400">
-                    {queueCount} {queueCount === 1 ? "item" : "itens"} pendente{queueCount > 1 ? "s" : ""} na fila
+                    {pendingCount} {pendingCount === 1 ? "item" : "itens"} pendente{pendingCount > 1 ? "s" : ""} na fila
                   </span>
                   <button
                     onClick={() => setCurrentView("queue")}
@@ -700,7 +600,7 @@ function App() {
               <div className="flex items-center justify-between">
                 <span className="text-sm text-gray-400">Status:</span>
                 <span className={`font-medium ${isRecording ? "text-red-500 animate-pulse" : "text-green-400"}`}>
-                  {status}
+                  {sessionBusy(session) ? sessionLabel(session) : status}
                 </span>
               </div>
 
@@ -711,30 +611,27 @@ function App() {
                     <span className="text-sm text-red-300">Recording in progress...</span>
                   </div>
 
-                  {/* Real-time transcript display */}
-                  {useRealtimeAPI && currentTranscript && (
-                    <div className="mt-3 pt-3 border-t border-red-500/30">
-                      <p className="text-xs text-gray-400 mb-1">Live Transcript:</p>
-                      <p className="text-sm text-white">{currentTranscript}</p>
-                    </div>
-                  )}
+
                 </div>
               )}
 
+              <SessionPanel session={session} onCopy={copyToClipboard} />
+              {shortcutErrors.length > 0 && <p role="alert" className="rounded border border-amber-600 p-3 text-sm text-amber-200">O Windows não liberou estes atalhos para o Dicta: {shortcutErrors.join(", ")}. Feche outra instância ou o aplicativo que está usando esses atalhos e reinicie o Dicta.</p>}
+
               <div className="border-t border-gray-700 pt-4">
-                <h2 className="text-lg font-semibold mb-2">Quick Start</h2>
+                <h2 className="text-lg font-semibold mb-2">Como usar</h2>
                 <ul className="text-sm text-gray-300 space-y-2">
                   <li>• Press <kbd className="px-2 py-1 bg-gray-700 rounded">Ctrl+Space</kbd> to start recording</li>
                   <li>• Speak naturally</li>
                   <li>• Press <kbd className="px-2 py-1 bg-gray-700 rounded">Ctrl+Space</kbd> again to stop</li>
-                  <li>• Your text will be automatically pasted</li>
+                  <li>• Ao terminar, o Dicta tenta colar no mesmo aplicativo; o texto permanece no histórico</li>
                   <li>• Press <kbd className="px-2 py-1 bg-gray-700 rounded">Alt+Shift+Z</kbd> to paste last transcription</li>
                 </ul>
               </div>
             </div>
 
             <div className="text-center text-xs text-gray-500">
-              Phase 0 - Local MVP • Hotkey: Ctrl+Space {isRecording ? "🔴" : "⚪"}
+              Build {buildId || "carregando…"} · Ctrl+Espaço
             </div>
           </>
         ) : currentView === "history" ? (
@@ -766,6 +663,7 @@ function App() {
                 ))}
               </div>
             )}
+            {historyHasMore && transcriptionHistory.length >= 100 && <button disabled={historyLoading} className="mt-4 rounded bg-gray-700 px-4 py-2 text-sm disabled:opacity-50" onClick={() => void loadMoreHistory()}>{historyLoading ? "Carregando…" : "Carregar mais"}</button>}
           </div>
         ) : currentView === "queue" ? (
           <div className="bg-gray-800 rounded-lg p-6">
@@ -790,10 +688,22 @@ function App() {
               )}
             </div>
 
+            {recoverySessions.length > 0 && <section aria-label="Sessões recuperáveis" className="space-y-3 mb-6">
+              <h3 className="font-medium">Áudio e comandos preservados</h3>
+              <p className="text-xs text-gray-400">Recuperar conclui o processamento e salva o texto. A fila não cola automaticamente.</p>
+              {recoverySessions.map(item => <div key={item.id} className="rounded border border-amber-700/50 p-3 flex flex-wrap justify-between gap-3">
+                <div className="text-sm"><p>{new Date(item.created_at).toLocaleString("pt-BR")}</p><p className="text-xs text-gray-400">{Math.floor(item.duration_ms / 1000)} s · {item.status === "incomplete" ? "Captura incompleta; revisão necessária" : "Pendente"}</p></div>
+                <div className="flex gap-2">
+                  <button disabled={sessionBusy(session) || item.status === "incomplete"} className="rounded bg-blue-600 px-3 py-1 text-sm disabled:opacity-40" onClick={() => void recoverSession(item.id)}>Recuperar</button>
+                  <button disabled={sessionBusy(session)} className="rounded bg-gray-700 px-3 py-1 text-sm" onClick={() => void discardSession(item.id)}>Descartar</button>
+                </div>
+              </div>)}
+            </section>}
+
             {queueItems.length === 0 ? (
               <div className="text-center py-12">
                 <p className="text-4xl mb-3">&#10003;</p>
-                <p className="text-gray-400">Nenhum item pendente na fila</p>
+                <p className="text-gray-400">Nenhum item da fila anterior</p>
                 <p className="text-gray-500 text-sm mt-1">
                   Itens aparecem aqui quando falham por problemas de conexao
                 </p>
@@ -821,6 +731,11 @@ function App() {
                              : item.mode}
                           </span>
                           <span className="text-xs text-gray-500">{item.model}</span>
+                          {item.auto_retry_disabled && (
+                            <span className="px-2 py-0.5 rounded text-xs font-medium bg-red-600/30 text-red-300">
+                              Auto retry pausado
+                            </span>
+                          )}
                         </div>
                         <p className="text-sm text-gray-400">
                           {formatDate(item.created_at)}
@@ -839,6 +754,11 @@ function App() {
                         {item.retry_count > 0 && (
                           <p className="text-xs text-yellow-500 mt-1">
                             {item.retry_count} tentativa{item.retry_count > 1 ? "s" : ""}
+                          </p>
+                        )}
+                        {item.last_error && (
+                          <p className="text-xs text-red-300 mt-2 break-words">
+                            {formatQueueError(item.last_error)}
                           </p>
                         )}
                       </div>
@@ -984,48 +904,14 @@ function App() {
           <div className="bg-gray-800 rounded-lg p-6">
             <h2 className="text-xl font-semibold mb-4">⚙️ Configurações</h2>
 
+            <label className="flex items-center gap-3 text-sm mb-4">
+              <input type="checkbox" checked={webSearch} onChange={async e => { const enabled = e.target.checked; try { await invoke("set_web_search_enabled", { enabled }); setWebSearch(enabled); } catch (error) { setStatus(String(error)); } }} />
+              Permitir busca na web nos comandos de assistência
+            </label>
+            <button className="mb-4 rounded bg-gray-700 px-3 py-2 text-sm" onClick={() => void invoke("recover_runtime").catch(error => setStatus(String(error)))}>Reconciliar sessão após retomada</button>
             {/* Microphone Selector */}
             <div className="space-y-4">
-              <div className="rounded-lg border border-gray-700 bg-gray-700/20 p-4 space-y-3">
-                <div className="flex items-center justify-between gap-4">
-                  <div>
-                    <p className="text-sm font-medium text-white">Modo de transcrição</p>
-                    <p className="text-xs text-gray-400">
-                      A primeira abertura usa Whisper. Depois disso, o Dicta mantém o último modo salvo.
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={async () => {
-                        setUseRealtimeAPI(false);
-                        await invoke("set_use_realtime", { useRealtime: false });
-                      }}
-                      disabled={isRecording}
-                      className={`px-3 py-1 rounded text-xs transition-colors ${
-                        !useRealtimeAPI
-                          ? "bg-blue-600 text-white"
-                          : "bg-gray-700 text-gray-300 hover:bg-gray-600"
-                      } ${isRecording ? "opacity-50 cursor-not-allowed" : ""}`}
-                    >
-                      Whisper
-                    </button>
-                    <button
-                      onClick={async () => {
-                        setUseRealtimeAPI(true);
-                        await invoke("set_use_realtime", { useRealtime: true });
-                      }}
-                      disabled={isRecording}
-                      className={`px-3 py-1 rounded text-xs transition-colors ${
-                        useRealtimeAPI
-                          ? "bg-blue-600 text-white"
-                          : "bg-gray-700 text-gray-300 hover:bg-gray-600"
-                      } ${isRecording ? "opacity-50 cursor-not-allowed" : ""}`}
-                    >
-                      Realtime
-                    </button>
-                  </div>
-                </div>
-              </div>
+              <TranscriptionSettings config={segmentConfig} model={asrModel} disabled={sessionBusy(session)} onConfig={saveSegmentConfig} onModel={saveAsrModel} />
 
               <div className="rounded-lg border border-gray-700 bg-gray-700/20 p-4 space-y-3">
                 <div>

@@ -41,6 +41,11 @@ src-tauri/WixTools
 *.wav
 debug_audio.wav
 
+# Local investigation snapshots (machine/profile metadata)
+openspec/**/evidence/baseline-local.json
+openspec/**/evidence/baseline-windows.json
+openspec/**/evidence/implementation-checks.json
+
 # Icon generation scripts (temporary)
 create-icon.ps1
 generate-icon.js

@@ -1,0 +1,55 @@
+
+running 4 tests
+test delivery_without_target_must_not_report_success ... FAILED
+test keyboard_cleanup_depends_on_enigo_drop ... ok
+test non_text_clipboard_must_not_be_replaced_with_empty_text ... FAILED
+test queue_error_with_unicode_must_not_panic ... FAILED
+
+failures:
+
+---- delivery_without_target_must_not_report_success stdout ----
+🔄 Auto-pasting text...
+💾 Saved original clipboard: 'original'
+📋 Transcription written to clipboard
+⏳ Waiting 1000ms for keys to be released...
+⌨️ Simulated Ctrl+V
+📋 Clipboard unchanged - paste likely succeeded, restoring original
+♻️ Restored original clipboard
+
+thread 'delivery_without_target_must_not_report_success' (41396) panicked at C:\Users\rapha\AppData\Local\Temp\dicta-regressions-s4wkFr\paste_regressions.rs:145:5:
+reproduced: native input returned Ok but fake target received nothing and function reported success
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- non_text_clipboard_must_not_be_replaced_with_empty_text stdout ----
+🔄 Auto-pasting text...
+⚠️ Clipboard read attempt 1 failed: not text, retrying...
+⚠️ Clipboard read attempt 2 failed: not text, retrying...
+⚠️ Failed to read clipboard after 3 attempts, using empty string
+💾 Saved original clipboard: ''
+📋 Transcription written to clipboard
+⏳ Waiting 1000ms for keys to be released...
+⌨️ Simulated Ctrl+V
+📋 Clipboard unchanged - paste likely succeeded, restoring original
+♻️ Restored original clipboard
+
+thread 'non_text_clipboard_must_not_be_replaced_with_empty_text' (43756) panicked at C:\Users\rapha\AppData\Local\Temp\dicta-regressions-s4wkFr\paste_regressions.rs:155:5:
+reproduced: original image could not be read as text and restore erased it
+
+---- queue_error_with_unicode_must_not_panic stdout ----
+
+thread 'queue_error_with_unicode_must_not_panic' (37212) panicked at C:\Users\rapha\AppData\Local\Temp\dicta-regressions-s4wkFr\paste_regressions.rs:138:34:
+byte index 240 is not a char boundary; it is inside 'é' (bytes 239..241) of `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaé more text`
+
+thread 'queue_error_with_unicode_must_not_panic' (37212) panicked at C:\Users\rapha\AppData\Local\Temp\dicta-regressions-s4wkFr\paste_regressions.rs:159:5:
+reproduced: byte 240 splits a UTF-8 character
+
+
+failures:
+    delivery_without_target_must_not_report_success
+    non_text_clipboard_must_not_be_replaced_with_empty_text
+    queue_error_with_unicode_must_not_panic
+
+test result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.40s
+
+
+Expected reproduction exit: 101

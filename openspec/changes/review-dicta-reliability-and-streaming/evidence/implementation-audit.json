@@ -1,0 +1,70 @@
+{
+  "captured_at": "2026-10-17T18:57:16.821Z",
+  "scope": "Local dependency audit; not a guarantee of binary or operating system security",
+  "all": {
+    "info": 0,
+    "low": 0,
+    "moderate": 2,
+    "high": 5,
+    "critical": 0,
+    "total": 7
+  },
+  "production": {
+    "info": 0,
+    "low": 0,
+    "moderate": 0,
+    "high": 0,
+    "critical": 0,
+    "total": 0
+  },
+  "packages": {
+    "braces": {
+      "severity": "high",
+      "fixAvailable": {
+        "name": "tailwindcss",
+        "version": "4.3.3",
+        "isSemVerMajor": true
+      }
+    },
+    "chokidar": {
+      "severity": "high",
+      "fixAvailable": {
+        "name": "tailwindcss",
+        "version": "4.3.3",
+        "isSemVerMajor": true
+      }
+    },
+    "fast-glob": {
+      "severity": "high",
+      "fixAvailable": true
+    },
+    "micromatch": {
+      "severity": "high",
+      "fixAvailable": {
+        "name": "tailwindcss",
+        "version": "4.3.3",
+        "isSemVerMajor": true
+      }
+    },
+    "postcss-nested": {
+      "severity": "moderate",
+      "fixAvailable": true
+    },
+    "postcss-selector-parser": {
+      "severity": "moderate",
+      "fixAvailable": {
+        "name": "tailwindcss",
+        "version": "4.3.3",
+        "isSemVerMajor": true
+      }
+    },
+    "tailwindcss": {
+      "severity": "high",
+      "fixAvailable": {
+        "name": "tailwindcss",
+        "version": "4.3.3",
+        "isSemVerMajor": true
+      }
+    }
+  }
+}

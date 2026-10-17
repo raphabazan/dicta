@@ -1,19 +1,24 @@
 mod audio;
-mod openai;
-mod realtime;
+mod capture;
 mod db;
-mod system_audio;
+mod delivery;
+mod diagnostics;
+mod dictation;
+mod lifecycle;
+pub mod openai;
 mod queue;
+pub mod segmentation;
+mod system_audio;
 
-use tauri::{Emitter, Manager, State, AppHandle, PhysicalPosition};
-use tauri::menu::{Menu, MenuItem};
-use tauri::tray::{TrayIconBuilder, TrayIconEvent};
-use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, GlobalShortcutExt};
-use tauri_plugin_clipboard_manager::ClipboardExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use enigo::{Enigo, Key, Keyboard, Settings};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State};
+use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
+
 #[cfg(target_os = "windows")]
 use windows::core::PWSTR;
 #[cfg(target_os = "windows")]
@@ -26,7 +31,9 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 fn ts() -> String {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = now.as_secs();
     let millis = now.subsec_millis();
     let hours = (secs % 86400) / 3600;
@@ -44,125 +51,68 @@ macro_rules! tlog {
 // Re-export TranscriptionEntry from db module
 use db::TranscriptionEntry;
 
-fn auto_paste_text(app: &AppHandle, text: &str) -> Result<(), String> {
-    println!("🔄 Auto-pasting text...");
-
-    // 1. Read current clipboard (with retry)
-    let original_clipboard = {
-        let mut attempts = 0;
-        loop {
-            match app.clipboard().read_text() {
-                Ok(content) => break content,
-                Err(e) => {
-                    attempts += 1;
-                    if attempts >= 3 {
-                        println!("⚠️ Failed to read clipboard after 3 attempts, using empty string");
-                        break String::new();
-                    }
-                    println!("⚠️ Clipboard read attempt {} failed: {}, retrying...", attempts, e);
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-            }
-        }
-    };
-
-    // Safely truncate clipboard preview (handle UTF-8 char boundaries)
-    let clipboard_preview = if original_clipboard.len() > 30 {
-        original_clipboard.chars().take(30).collect::<String>() + "..."
-    } else {
-        original_clipboard.clone()
-    };
-    println!("💾 Saved original clipboard: '{}'", clipboard_preview);
-
-    // 2. Write transcribed text to clipboard (with retry)
-    {
-        let mut attempts = 0;
-        loop {
-            match app.clipboard().write_text(text) {
-                Ok(_) => {
-                    println!("📋 Transcription written to clipboard");
-                    break;
-                }
-                Err(e) => {
-                    attempts += 1;
-                    if attempts >= 3 {
-                        return Err(format!("Failed to write to clipboard after 3 attempts: {}", e));
-                    }
-                    println!("⚠️ Clipboard write attempt {} failed: {}, retrying...", attempts, e);
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-            }
-        }
+fn context(state: &AppState, app: AppHandle) -> dictation::Context {
+    dictation::Context {
+        app,
+        database: state.database.clone(),
+        client: state.openai_client.clone(),
+        manager: state.sessions.clone(),
+        last_text: state.last_transcription.clone(),
+        is_recording: state.is_recording.clone(),
+        root: state.session_dir.clone(),
     }
+}
 
-    // 3. Wait for:
-    // - Clipboard to update
-    // - User to release Alt+Shift+Z keys (CRITICAL!)
-    // - Focus to return to the target application
-    // IMPORTANT: We need to wait long enough for the user to release the modifier keys
-    // (Alt+Shift+Z) otherwise the Ctrl+V simulation won't work because the OS sees
-    // conflicting modifier keys pressed at the same time
-    println!("⏳ Waiting 1000ms for keys to be released...");
-    std::thread::sleep(Duration::from_millis(1000));
+fn load_segment_config(database: &db::Database) -> segmentation::SegmentConfig {
+    database
+        .load_setting("segment_config")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .filter(|c: &segmentation::SegmentConfig| c.validate().is_ok())
+        .unwrap_or_default()
+}
 
-    // 4. Simulate Ctrl+V
-    let mut enigo = Enigo::new(&Settings::default())
-        .map_err(|e| format!("Failed to create Enigo: {:?}", e))?;
-
-    enigo.key(Key::Control, enigo::Direction::Press)
-        .map_err(|e| format!("Failed to press Ctrl: {:?}", e))?;
-    enigo.key(Key::Unicode('v'), enigo::Direction::Click)
-        .map_err(|e| format!("Failed to press V: {:?}", e))?;
-    enigo.key(Key::Control, enigo::Direction::Release)
-        .map_err(|e| format!("Failed to release Ctrl: {:?}", e))?;
-
-    println!("⌨️ Simulated Ctrl+V");
-
-    // 5. Wait for paste to complete and check if clipboard changed
-    std::thread::sleep(Duration::from_millis(150));
-
-    // 6. Check if clipboard still has our transcribed text
-    let current_clipboard = app.clipboard().read_text()
-        .map_err(|e| format!("Failed to read clipboard after paste: {}", e))?;
-
-    // If clipboard still has our text, the paste likely succeeded
-    // Only restore if clipboard was consumed (changed)
-    if current_clipboard == text {
-        println!("📋 Clipboard unchanged - paste likely succeeded, restoring original");
-        app.clipboard().write_text(&original_clipboard)
-            .map_err(|e| format!("Failed to restore clipboard: {}", e))?;
-        println!("♻️ Restored original clipboard");
-    } else {
-        println!("🔄 Clipboard was consumed - paste succeeded, keeping current state");
-    }
-
-    Ok(())
+fn toggle_recording_from_hotkey(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let command_app = app.clone();
+        let state = app.state::<AppState>();
+        let recording = *state.is_recording.lock().unwrap();
+        let result = if recording {
+            stop_recording_audio(state, command_app).await
+        } else {
+            start_recording_audio(state, command_app).await
+        };
+        if result.is_err() {
+            diagnostics::event(
+                "recording_toggle_failed",
+                serde_json::json!({"was_recording":recording}),
+            );
+            let _ = app.emit(
+                "recording-error",
+                "Não foi possível iniciar ou encerrar a gravação. Confira a sessão no Dicta.",
+            );
+        }
+    });
 }
 
 struct AppState {
-    audio_recorder: Arc<Mutex<audio::AudioRecorder>>,
     openai_client: Arc<openai::OpenAIClient>,
-    realtime_client: Arc<realtime::RealtimeClient>,
     database: Arc<db::Database>,
+    sessions: Arc<dictation::Manager>,
+    session_dir: PathBuf,
+    next_target: Arc<Mutex<Option<delivery::Target>>>,
     is_recording: Arc<Mutex<bool>>,
-    use_realtime: Arc<Mutex<bool>>, // Track which API to use
-    prompt_mode: Arc<Mutex<Option<String>>>, // Track prompt mode: None, Some("gpt-4o-mini"), or Some("gpt-4o")
-    current_session_transcript: Arc<Mutex<String>>, // Accumulate transcript for current session
+    prompt_mode: Arc<Mutex<Option<String>>>,
     last_transcription: Arc<Mutex<Option<String>>>,
-    paste_in_progress: Arc<Mutex<bool>>,
-    recording_start_time: Arc<Mutex<Option<Instant>>>,
-    speech_active: Arc<Mutex<bool>>, // Track if speech is currently being detected
-    last_speech_end: Arc<Mutex<Option<Instant>>>, // Track when last speech ended
-    last_transcription_time: Arc<Mutex<Option<Instant>>>, // Track when last transcription.completed arrived
     tts_enabled: Arc<Mutex<bool>>,
     tts_sink: Arc<Mutex<Option<rodio::Sink>>>,
     tts_stream_handle: Arc<Mutex<Option<rodio::OutputStreamHandle>>>,
     tts_active: Arc<Mutex<bool>>,
     queue_dir: PathBuf,
-    streaming_stop_handle: Arc<Mutex<Option<audio::StreamingStopHandle>>>,
+    shortcut_errors: Arc<Mutex<Vec<String>>>,
 }
 
-const DEFAULT_USE_REALTIME: bool = false;
 const DEFAULT_PROMPT_MODEL: &str = "gpt-5.4";
 const DEFAULT_TRANSCRIPTION_LANGUAGES: [&str; 2] = ["pt", "en"];
 const DEFAULT_GAME_MODE_ENABLED: bool = false;
@@ -175,7 +125,7 @@ fn parse_bool_setting(value: Option<String>, default: bool) -> bool {
 
 fn normalize_prompt_model(model: &str) -> String {
     match model {
-        "gpt-5.4" | "gpt-4o-mini" | "transcribe-only" => model.to_string(),
+        "gpt-5.4" | "gpt-6.1-sol" | "gpt-4o-mini" | "transcribe-only" => model.to_string(),
         _ => "transcribe-only".to_string(),
     }
 }
@@ -239,7 +189,10 @@ fn load_transcription_languages(database: &db::Database) -> Vec<String> {
     normalize_transcription_languages(stored)
 }
 
-fn save_transcription_languages(database: &db::Database, languages: Vec<String>) -> Result<Vec<String>, String> {
+fn save_transcription_languages(
+    database: &db::Database,
+    languages: Vec<String>,
+) -> Result<Vec<String>, String> {
     let normalized = normalize_transcription_languages(languages);
     database
         .save_setting("transcription_languages", &normalized.join(","))
@@ -287,7 +240,10 @@ fn load_game_mode_processes(database: &db::Database) -> Vec<String> {
     normalize_game_mode_processes(stored)
 }
 
-fn save_game_mode_processes(database: &db::Database, processes: Vec<String>) -> Result<Vec<String>, String> {
+fn save_game_mode_processes(
+    database: &db::Database,
+    processes: Vec<String>,
+) -> Result<Vec<String>, String> {
     let normalized = normalize_game_mode_processes(processes);
     database
         .save_setting("game_mode_processes", &normalized.join(","))
@@ -310,7 +266,8 @@ fn get_foreground_process_info() -> Option<(String, String)> {
         return None;
     }
 
-    let process_handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }.ok()?;
+    let process_handle =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }.ok()?;
     let mut buffer = vec![0u16; 1024];
     let mut len = buffer.len() as u32;
 
@@ -396,17 +353,6 @@ fn build_transcription_hints(database: &db::Database) -> (Option<String>, Option
     )
 }
 
-fn resolve_prompt_session(state: &AppState) -> (bool, String) {
-    let current_model = load_selected_prompt_model(&state.database);
-    *state.prompt_mode.lock().unwrap() = None;
-
-    if current_model == "transcribe-only" {
-        (false, String::new())
-    } else {
-        (true, current_model)
-    }
-}
-
 /// Strip markdown links, citations, and raw URLs from text for TTS playback.
 fn strip_links_for_tts(text: &str) -> String {
     // 1. Markdown links [text](url) → text
@@ -417,15 +363,25 @@ fn strip_links_for_tts(text: &str) -> String {
             let mut link_text = String::new();
             let mut found_close = false;
             for inner in chars.by_ref() {
-                if inner == ']' { found_close = true; break; }
+                if inner == ']' {
+                    found_close = true;
+                    break;
+                }
                 link_text.push(inner);
             }
             if found_close && chars.peek() == Some(&'(') {
                 chars.next(); // skip '('
                 let mut depth = 1;
                 for inner in chars.by_ref() {
-                    if inner == '(' { depth += 1; }
-                    if inner == ')' { depth -= 1; if depth == 0 { break; } }
+                    if inner == '(' {
+                        depth += 1;
+                    }
+                    if inner == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
                 }
                 // Only keep link text if it doesn't look like a domain
                 if !looks_like_url(&link_text) {
@@ -434,7 +390,9 @@ fn strip_links_for_tts(text: &str) -> String {
             } else {
                 result.push('[');
                 result.push_str(&link_text);
-                if found_close { result.push(']'); }
+                if found_close {
+                    result.push(']');
+                }
             }
         } else {
             result.push(c);
@@ -458,7 +416,8 @@ fn strip_links_for_tts(text: &str) -> String {
         i += 1;
     }
     // 3. Remove remaining raw URLs
-    clean.split_whitespace()
+    clean
+        .split_whitespace()
         .filter(|w| !looks_like_url(w))
         .collect::<Vec<_>>()
         .join(" ")
@@ -471,7 +430,9 @@ fn looks_like_url(s: &str) -> bool {
         return true;
     }
     // Match domain patterns like "site.com", "site.com.br", "site.org/path"
-    let tlds = [".com", ".org", ".net", ".br", ".io", ".dev", ".gov", ".edu", ".info", ".co"];
+    let tlds = [
+        ".com", ".org", ".net", ".br", ".io", ".dev", ".gov", ".edu", ".info", ".co",
+    ];
     tlds.iter().any(|tld| s.contains(tld))
 }
 
@@ -525,19 +486,27 @@ async fn play_tts_chunked(
 
         while let Ok(audio_bytes) = audio_rx.recv() {
             // Check if cancelled
-            if !*tts_active_for_thread.lock().unwrap() { break; }
+            if !*tts_active_for_thread.lock().unwrap() {
+                break;
+            }
 
             // Wait for previous chunk to finish
             if let Some(ref sink) = current_sink {
                 while !sink.empty() {
-                    if !*tts_active_for_thread.lock().unwrap() { break; }
+                    if !*tts_active_for_thread.lock().unwrap() {
+                        break;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
-                if !*tts_active_for_thread.lock().unwrap() { break; }
+                if !*tts_active_for_thread.lock().unwrap() {
+                    break;
+                }
             }
 
             // Stop previous and play new
-            if let Some(s) = current_sink.take() { s.stop(); }
+            if let Some(s) = current_sink.take() {
+                s.stop();
+            }
 
             if let Ok(src) = rodio::Decoder::new(std::io::Cursor::new(audio_bytes)) {
                 if let Ok(sink) = rodio::Sink::try_new(&stream_handle) {
@@ -550,7 +519,9 @@ async fn play_tts_chunked(
         // Wait for last chunk to finish playing
         if let Some(ref sink) = current_sink {
             while !sink.empty() {
-                if !*tts_active_for_thread.lock().unwrap() { break; }
+                if !*tts_active_for_thread.lock().unwrap() {
+                    break;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
@@ -563,7 +534,12 @@ async fn play_tts_chunked(
             break;
         }
 
-        println!("🔊 TTS chunk {}/{}: generating audio for {} chars...", i + 1, chunks.len(), chunk.len());
+        println!(
+            "🔊 TTS chunk {}/{}: generating audio for {} chars...",
+            i + 1,
+            chunks.len(),
+            chunk.len()
+        );
 
         match openai.speak_text(chunk).await {
             Ok(audio) => {
@@ -598,363 +574,283 @@ async fn play_tts_chunked(
 }
 
 #[tauri::command]
-async fn cancel_recording(state: State<'_, AppState>) -> Result<String, String> {
-    let mut is_recording = state.is_recording.lock().unwrap();
-    if !*is_recording {
-        return Err("Not recording".to_string());
-    }
-
-    println!("❌ Cancelling recording...");
-    *is_recording = false;
-
-    // Stop Whisper mode recorder (discard audio)
-    let recorder = state.audio_recorder.lock().unwrap();
-    let _ = recorder.stop_recording();
-
-    // Stop realtime mode streaming (release microphone + kill WebSocket tasks)
-    if let Some(handle) = state.streaming_stop_handle.lock().unwrap().take() {
-        handle.stop();
-        println!("🔌 Realtime streaming stopped via cancel");
-    }
-
-    // Restore system audio
-    if let Err(e) = system_audio::unmute_system_audio() {
-        eprintln!("⚠️ Failed to unmute system audio: {}", e);
-    }
-
-    Ok("Recording cancelled".to_string())
+async fn cancel_recording(state: State<'_, AppState>, app: AppHandle) -> Result<String, String> {
+    state.sessions.interrupt(&app, true);
+    *state.is_recording.lock().unwrap() = false;
+    let _ = system_audio::unmute_system_audio();
+    Ok("Recording cancelled".into())
 }
 
 #[tauri::command]
-async fn start_recording_audio(state: State<'_, AppState>, app: AppHandle) -> Result<String, String> {
-    let mut is_recording = state.is_recording.lock().unwrap();
-    if *is_recording {
-        return Err("Already recording".to_string());
-    }
-
-    println!("🎤 Starting audio recording...");
-
-    // Set recording start time
-    *state.recording_start_time.lock().unwrap() = Some(Instant::now());
-
-    // Get selected microphone from settings
-    let selected_mic = state.database.load_setting("selected_microphone")
+async fn start_recording_audio(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let ctx = context(&state, app.clone());
+    let id = dictation::new_id();
+    let model = state
+        .database
+        .load_setting("asr_model")
+        .ok()
+        .flatten()
+        .filter(|m| ["whisper-1", "gpt-transcribe"].contains(&m.as_str()))
+        .unwrap_or_else(|| "whisper-1".into());
+    let (_, hint) = build_transcription_hints(&state.database);
+    let mut config = dictation::Config {
+        segments: load_segment_config(&state.database),
+        asr_model: model,
+        prompt_model: Some(load_selected_prompt_model(&state.database))
+            .filter(|m| m != "transcribe-only"),
+        languages: load_transcription_languages(&state.database),
+        hint,
+        web_search: parse_bool_setting(
+            state
+                .database
+                .load_setting("web_search_enabled")
+                .ok()
+                .flatten(),
+            false,
+        ),
+        rate: 0,
+        input_text: None,
+        image_data: None,
+    };
+    let microphone = state
+        .database
+        .load_setting("selected_microphone")
         .ok()
         .flatten();
-
-    let recorder = state.audio_recorder.lock().unwrap();
-    recorder.start_recording(selected_mic)?;
-    *is_recording = true;
-
-    // Mute system audio while recording (frontend already waited for start sound to finish)
-    if let Err(e) = system_audio::mute_system_audio() {
-        eprintln!("⚠️ Failed to mute system audio: {}", e);
+    let target = state
+        .next_target
+        .lock()
+        .unwrap()
+        .take()
+        .or_else(delivery::capture_target);
+    let ctx_prepare = ctx.clone();
+    let prepare_id = id.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let result = dictation::prepare(&ctx_prepare, &mut config, microphone, &prepare_id);
+        (result, config)
+    })
+    .await
+    .map_err(|_| "Falha ao iniciar captura.".to_string())?;
+    let (capture, interruption) = match prepared.0 {
+        Ok(value) => value,
+        Err(error) => {
+            ctx.manager.finished(&id);
+            return Err(error);
+        }
+    };
+    *state.is_recording.lock().unwrap() = true;
+    if !(cfg!(debug_assertions) && std::env::var_os("DICTA_TEST_AUDIO").is_some()) {
+        let _ = system_audio::mute_system_audio();
     }
-
-    // Spawn timer task for Whisper mode
-    let is_recording_flag = state.is_recording.clone();
-    let recording_start = state.recording_start_time.clone();
-    let app_clone = app.clone();
-
+    let tts = (
+        state.tts_enabled.clone(),
+        state.tts_sink.clone(),
+        state.tts_stream_handle.clone(),
+        state.tts_active.clone(),
+    );
     tokio::spawn(async move {
-        let mut warning_shown = false;
-        let mut auto_stop_triggered = false;
-
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-            if !*is_recording_flag.lock().unwrap() {
-                break;
+        let result = dictation::run(
+            ctx.clone(),
+            id.clone(),
+            prepared.1,
+            capture,
+            interruption,
+            target,
+        )
+        .await;
+        *ctx.is_recording.lock().unwrap() = false;
+        let _ = system_audio::unmute_system_audio();
+        if let Some(widget) = ctx.app.get_webview_window("recording-widget") {
+            let _ = widget.hide();
+        }
+        if let Err(error) = &result {
+            if ctx.manager.snapshot().phase != "incomplete" {
+                dictation::fail(&ctx, &id, error, "recoverable");
             }
-
-            if let Some(start_time) = *recording_start.lock().unwrap() {
-                let elapsed = start_time.elapsed();
-
-                // Show warning at 5 minutes
-                if elapsed >= Duration::from_secs(5 * 60) && !warning_shown {
-                    warning_shown = true;
-                    println!("⚠️ [WHISPER] 5 seconds elapsed, showing warning...");
-                    println!("⚠️ [WHISPER] Elapsed time: {:?}", elapsed);
-
-                    if let Some(warning) = app_clone.get_webview_window("warning-widget") {
-                        println!("⚠️ [WHISPER] Found warning widget");
-
-                        if let Some(widget) = app_clone.get_webview_window("recording-widget") {
-                            println!("⚠️ [WHISPER] Found recording widget");
-                            if let Ok(widget_pos) = widget.outer_position() {
-                                let warning_x = widget_pos.x - 77;
-                                let warning_y = widget_pos.y - 70;
-                                println!("⚠️ [WHISPER] Positioning warning at x:{}, y:{}", warning_x, warning_y);
-                                match warning.set_position(PhysicalPosition::new(warning_x, warning_y)) {
-                                    Ok(_) => println!("⚠️ [WHISPER] ✅ Position set successfully"),
-                                    Err(e) => println!("⚠️ [WHISPER] ❌ Failed to set position: {}", e),
-                                }
-                            }
-                        } else {
-                            println!("⚠️ [WHISPER] ❌ Recording widget not found for positioning");
-                        }
-
-                        match warning.show() {
-                            Ok(_) => {
-                                println!("⚠️ [WHISPER] ✅ Warning shown successfully");
-
-                                // Auto-hide warning after 4 seconds
-                                let warning_clone = warning.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-                                    println!("⚠️ [WHISPER] Auto-hiding warning after 4 seconds");
-                                    match warning_clone.hide() {
-                                        Ok(_) => println!("⚠️ [WHISPER] ✅ Warning auto-hidden successfully"),
-                                        Err(e) => println!("⚠️ [WHISPER] ❌ Failed to auto-hide warning: {}", e),
-                                    }
-                                });
-                            },
-                            Err(e) => println!("⚠️ [WHISPER] ❌ Failed to show warning: {}", e),
-                        }
-                    } else {
-                        println!("⚠️ [WHISPER] ❌ Warning widget not found!");
-                    }
-                }
-
-                // Auto-stop at 6 minutes
-                if elapsed >= Duration::from_secs(6 * 60) && !auto_stop_triggered {
-                    auto_stop_triggered = true;
-                    println!("⏰ [WHISPER] 6 minutes limit reached, auto-stopping...");
-                    println!("⏰ [WHISPER] Elapsed time: {:?}", elapsed);
-
-                    // DON'T set is_recording = false here - let the frontend's stopRecording() do it
-
-                    if let Some(window) = app_clone.get_webview_window("main") {
-                        println!("⏰ [WHISPER] Found main window, emitting widget-stop-recording event");
-                        match window.emit("widget-stop-recording", ()) {
-                            Ok(_) => println!("⏰ [WHISPER] ✅ Event emitted successfully"),
-                            Err(e) => println!("⏰ [WHISPER] ❌ Failed to emit event: {}", e),
-                        }
-                    } else {
-                        println!("⏰ [WHISPER] ❌ Main window not found!");
-                    }
-
-                    // Hide recording widget
-                    if let Some(widget) = app_clone.get_webview_window("recording-widget") {
-                        println!("⏰ [WHISPER] Found recording widget, hiding it");
-                        match widget.hide() {
-                            Ok(_) => println!("⏰ [WHISPER] ✅ Widget hidden successfully"),
-                            Err(e) => println!("⏰ [WHISPER] ❌ Failed to hide widget: {}", e),
-                        }
-                    } else {
-                        println!("⏰ [WHISPER] ❌ Recording widget not found!");
-                    }
-
-                    // DON'T break - let the loop continue until frontend calls stop
-                }
+        }
+        ctx.manager.finished(&id);
+        if let Ok(Some(text)) = result {
+            let prompt = ctx
+                .database
+                .load_setting("selected_prompt_model")
+                .ok()
+                .flatten()
+                .is_some_and(|m| m != "transcribe-only");
+            if prompt && *tts.0.lock().unwrap() {
+                tauri::async_runtime::spawn(play_tts_chunked(
+                    ctx.app.clone(),
+                    text,
+                    ctx.client.clone(),
+                    tts.1,
+                    tts.2,
+                    tts.3,
+                ));
             }
         }
     });
-
-    Ok("Recording started".to_string())
+    Ok("Recording started".into())
 }
 
 #[tauri::command]
-async fn stop_recording_audio(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<String, String> {
-    let mut is_recording = state.is_recording.lock().unwrap();
-    if !*is_recording {
-        return Err("Not recording".to_string());
+async fn stop_recording_audio(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    state.sessions.stop(&app)?;
+    *state.is_recording.lock().unwrap() = false;
+    let _ = app.emit("recording-sound-stop", ());
+    Ok("Finalizing recording".into())
+}
+
+#[tauri::command]
+fn get_session_state(state: State<'_, AppState>) -> dictation::Snapshot {
+    state.sessions.snapshot()
+}
+
+#[tauri::command]
+fn get_segment_config(state: State<'_, AppState>) -> segmentation::SegmentConfig {
+    load_segment_config(&state.database)
+}
+
+#[tauri::command]
+fn set_segment_config(
+    state: State<'_, AppState>,
+    config: segmentation::SegmentConfig,
+) -> Result<(), String> {
+    if state.sessions.busy() {
+        return Err("Aguarde a sessão atual terminar.".into());
     }
+    config.validate()?;
+    state
+        .database
+        .save_setting(
+            "segment_config",
+            &serde_json::to_string(&config).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())
+}
 
-    println!("⏹️ Stopping audio recording...");
-    let recorder = state.audio_recorder.lock().unwrap();
-    let audio_data = recorder.stop_recording();
-    *is_recording = false;
+#[tauri::command]
+fn get_asr_model(state: State<'_, AppState>) -> String {
+    state
+        .database
+        .load_setting("asr_model")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "whisper-1".into())
+}
 
-    // Restore system audio
-    if let Err(e) = system_audio::unmute_system_audio() {
-        eprintln!("⚠️ Failed to unmute system audio: {}", e);
+#[tauri::command]
+fn set_asr_model(state: State<'_, AppState>, model: String) -> Result<(), String> {
+    if state.sessions.busy() {
+        return Err("Aguarde a sessão atual terminar.".into());
     }
-
-    // Capture recording duration for stats
-    let duration_ms = state.recording_start_time.lock().unwrap()
-        .map(|start| start.elapsed().as_millis() as i64);
-
-    if audio_data.is_empty() {
-        return Err("No audio recorded".to_string());
+    if !["whisper-1", "gpt-transcribe"].contains(&model.as_str()) {
+        return Err("Modelo de transcrição não suportado.".into());
     }
+    state
+        .database
+        .save_setting("asr_model", &model)
+        .map_err(|e| e.to_string())
+}
 
-    let (should_use_prompt, selected_model) = resolve_prompt_session(&state);
+#[tauri::command]
+fn get_recoverable_sessions(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    state.database.load_recoverable_sessions().map(|rows|rows.into_iter().map(|row|serde_json::json!({"id":row.id,"status":row.status,"created_at":row.created_at,"duration_ms":row.duration_ms})).collect()).map_err(|e|e.to_string())
+}
 
-    // Load conversation history before spawning (inactivity check happens here)
-    let conv_history = get_conversation_history(&state.database);
+#[tauri::command]
+fn get_web_search_enabled(state: State<'_, AppState>) -> bool {
+    parse_bool_setting(
+        state
+            .database
+            .load_setting("web_search_enabled")
+            .ok()
+            .flatten(),
+        false,
+    )
+}
+#[tauri::command]
+fn set_web_search_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    state
+        .database
+        .save_setting("web_search_enabled", if enabled { "true" } else { "false" })
+        .map_err(|e| e.to_string())
+}
 
-    // Transcribe (without post-processing for speed)
-    let openai = state.openai_client.clone();
-    let last_transcription = state.last_transcription.clone();
-    let database = state.database.clone();
-    let app_handle = app.clone();
-    let tts_enabled = state.tts_enabled.clone();
-    let tts_sink = state.tts_sink.clone();
-    let tts_stream_handle = state.tts_stream_handle.clone();
-    let tts_active = state.tts_active.clone();
-    let openai_for_tts = state.openai_client.clone();
-    let queue_dir = state.queue_dir.clone();
-    let audio_data_for_queue = audio_data.clone();
-    let selected_model_for_queue = selected_model.clone();
-    let transcription_hints_for_queue = build_transcription_hints(&state.database);
-    tokio::spawn(async move {
-        match openai.transcribe_audio(
-            audio_data,
-            48000,
-            transcription_hints_for_queue.0.as_deref(),
-            transcription_hints_for_queue.1.as_deref(),
-        ).await {
-            Ok(transcribed_text) => {
-                println!("✨ Transcribed: {}", transcribed_text);
+#[tauri::command]
+async fn retry_session(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    id: String,
+) -> Result<(), String> {
+    if !dictation::valid_id(&id) {
+        return Err("Sessão inválida.".into());
+    }
+    let ctx = context(&state, app);
+    dictation::recover(ctx, id).await
+}
 
-                // Check if we're in prompt mode
-                if should_use_prompt {
-                    let model = selected_model_for_queue.clone();
-                    println!("🤖 Prompt mode active with model: {}", model);
-
-                    // Send transcribed text as prompt to GPT
-                    match openai.send_prompt(&transcribed_text, &model, &conv_history, None).await {
-                        Ok(gpt_response) => {
-                            println!("✨ GPT Response: {}", gpt_response);
-
-                            // Save GPT response as last transcription
-                            *last_transcription.lock().unwrap() = Some(gpt_response.clone());
-
-                            // Save to database (save the GPT response, not the prompt)
-                            let timestamp = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as i64;
-                            let cost = estimate_cost_cents(&model, duration_ms, &gpt_response);
-
-                            if let Err(e) = database.save_transcription(&gpt_response, timestamp, duration_ms, Some(&model), Some(cost), Some("prompt")) {
-                                eprintln!("❌ Failed to save to database: {}", e);
-                            }
-
-                            // Save to conversation history
-                            let _ = database.append_conversation("user", &transcribed_text, timestamp - 1);
-                            let _ = database.append_conversation("assistant", &gpt_response, timestamp);
-
-                            // Notify frontend
-                            if let Some(window) = app_handle.get_webview_window("main") {
-                                let _ = window.emit("history-updated", ());
-                            }
-
-                            // Auto-paste GPT response
-                            match auto_paste_text(&app_handle, &gpt_response) {
-                                Ok(_) => println!("✅ GPT response auto-pasted successfully"),
-                                Err(e) => {
-                                    eprintln!("⚠️ Auto-paste failed: {}", e);
-                                    if let Some(window) = app_handle.get_webview_window("main") {
-                                        let _ = window.emit("paste-failed", ());
-                                    }
-                                }
-                            }
-
-                            // Notification sound
-                            if let Some(window) = app_handle.get_webview_window("main") {
-                                let _ = window.emit("response-ready", ());
-                            }
-
-                            // TTS (chunked)
-                            if *tts_enabled.lock().unwrap() {
-                                tauri::async_runtime::spawn(play_tts_chunked(
-                                    app_handle.clone(), gpt_response.clone(),
-                                    openai_for_tts.clone(), tts_sink.clone(),
-                                    tts_stream_handle.clone(), tts_active.clone(),
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("❌ GPT prompt error: {}", e);
-                            let count = database.count_queue().unwrap_or(0);
-                            if count < queue::MAX_QUEUE_SIZE {
-                                let _ = database.enqueue_item(
-                                    "whisper-prompt",
-                                    None,
-                                    Some(&transcribed_text),
-                                    &model,
-                                    now_ms(),
-                                );
-                                emit_queue_updated(&app_handle, &database);
-                            } else {
-                                emit_queue_full(&app_handle);
-                            }
-                        }
-                    }
-                } else {
-                    // Normal transcription mode
-                    // Save last transcription
-                    *last_transcription.lock().unwrap() = Some(transcribed_text.clone());
-
-                    // Save to database
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as i64;
-                    let cost = estimate_cost_cents("whisper", duration_ms, &transcribed_text);
-
-                    if let Err(e) = database.save_transcription(&transcribed_text, timestamp, duration_ms, Some("whisper"), Some(cost), Some("transcription")) {
-                        eprintln!("❌ Failed to save to database: {}", e);
-                    }
-
-                    // Notify frontend that history was updated
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.emit("history-updated", ());
-                    }
-
-                    // Auto-paste: save clipboard, paste, restore
-                    match auto_paste_text(&app_handle, &transcribed_text) {
-                        Ok(_) => println!("✅ Text auto-pasted successfully"),
-                        Err(e) => {
-                            eprintln!("⚠️ Auto-paste failed: {}", e);
-                            // Notify frontend of failure
-                            if let Some(window) = app_handle.get_webview_window("main") {
-                                let _ = window.emit("paste-failed", ());
-                            }
-                        }
-                    }
-
-                    // Notification sound
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.emit("response-ready", ());
-                    }
-
-                    // TTS skipped for transcribe-only (would just repeat what user said)
-                }
-            }
-            Err(e) => {
-                eprintln!("❌ Transcription error: {}", e);
-                let count = database.count_queue().unwrap_or(0);
-                if count < queue::MAX_QUEUE_SIZE {
-                    let mode = if should_use_prompt { "whisper-prompt" } else { "whisper-transcribe" };
-                    let model_name = if should_use_prompt {
-                        selected_model_for_queue.as_str()
-                    } else {
-                        "whisper"
-                    };
-                    match queue::save_audio_to_wav(audio_data_for_queue, &queue_dir) {
-                        Ok(wav_path) => {
-                            let _ = database.enqueue_item(
-                                mode,
-                                Some(wav_path.to_str().unwrap_or("")),
-                                None,
-                                model_name,
-                                now_ms(),
-                            );
-                            emit_queue_updated(&app_handle, &database);
-                        }
-                        Err(wav_err) => eprintln!("❌ Failed to save audio to queue: {}", wav_err),
-                    }
-                } else {
-                    emit_queue_full(&app_handle);
-                }
+#[tauri::command]
+fn discard_session(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    if !dictation::valid_id(&id) || state.sessions.busy() {
+        return Err("Não é possível descartar esta sessão agora.".into());
+    }
+    state
+        .database
+        .update_session(&id, "cancelled", 0, "")
+        .map_err(|e| e.to_string())?;
+    // Remove only generated files in the verified session directory; no recursive deletion.
+    let root = state.session_dir.join(&id);
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                let _ = std::fs::remove_file(entry.path());
             }
         }
-    });
+    }
+    let _ = std::fs::remove_dir(root);
+    Ok(())
+}
 
-    Ok("Recording stopped, processing...".to_string())
+#[tauri::command]
+async fn paste_last_transcription(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<delivery::Outcome, String> {
+    let text = state
+        .database
+        .load_latest_transcription()
+        .map_err(|e| e.to_string())?
+        .ok_or("Nenhuma transcrição disponível.")?
+        .text;
+    let target = delivery::capture_target();
+    tokio::task::spawn_blocking(move || delivery::deliver(&app, &text, target))
+        .await
+        .map_err(|_| "Falha na entrega.".into())
+}
+
+#[tauri::command]
+fn get_build_info() -> String {
+    diagnostics::build_id().into()
+}
+
+#[tauri::command]
+fn get_shortcut_errors(state: State<'_, AppState>) -> Vec<String> {
+    state.shortcut_errors.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn recover_runtime(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+    delivery::invalidate();
+    state.sessions.interrupt(&app, false);
+    *state.is_recording.lock().unwrap() = false;
+    system_audio::unmute_system_audio()?;
+    let _ = app.emit("runtime-resumed", ());
+    Ok(())
 }
 
 #[tauri::command]
@@ -967,29 +863,35 @@ fn get_last_transcription(state: State<'_, AppState>) -> Result<String, String> 
 }
 
 #[tauri::command]
-fn get_transcription_history(state: State<'_, AppState>) -> Result<Vec<TranscriptionEntry>, String> {
-    state.database.load_transcriptions()
+fn get_transcription_history(
+    state: State<'_, AppState>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> Result<Vec<TranscriptionEntry>, String> {
+    state
+        .database
+        .load_history_page(limit.unwrap_or(100), offset.unwrap_or(0))
         .map_err(|e| format!("Failed to load history: {}", e))
 }
 
 #[tauri::command]
 fn copy_to_clipboard(app: AppHandle, text: String) -> Result<(), String> {
-    app.clipboard().write_text(text)
+    app.clipboard()
+        .write_text(text)
         .map_err(|e| format!("Failed to write to clipboard: {}", e))
 }
 
 #[tauri::command]
-fn set_use_realtime(state: State<'_, AppState>, use_realtime: bool) -> Result<(), String> {
-    *state.use_realtime.lock().unwrap() = use_realtime;
-    state.database.save_setting("use_realtime", if use_realtime { "true" } else { "false" })
-        .map_err(|e| format!("Failed to save transcription mode: {}", e))?;
-    println!("🔄 Switched to {} mode", if use_realtime { "Realtime" } else { "Whisper" });
-    Ok(())
+fn set_use_realtime(use_realtime: bool) -> Result<(), String> {
+    if use_realtime {
+        Err("O Realtime legado foi retirado. Use o envio por pausas nas configurações.".into())
+    } else {
+        Ok(())
+    }
 }
-
 #[tauri::command]
-fn get_use_realtime(state: State<'_, AppState>) -> Result<bool, String> {
-    Ok(*state.use_realtime.lock().unwrap())
+fn get_use_realtime() -> bool {
+    false
 }
 
 #[tauri::command]
@@ -1008,7 +910,9 @@ fn list_microphones() -> Result<Vec<String>, String> {
 
 #[tauri::command]
 fn set_selected_microphone(state: State<'_, AppState>, device_name: String) -> Result<(), String> {
-    state.database.save_setting("selected_microphone", &device_name)
+    state
+        .database
+        .save_setting("selected_microphone", &device_name)
         .map_err(|e| format!("Failed to save microphone setting: {}", e))?;
     println!("🎤 Selected microphone: {}", device_name);
     Ok(())
@@ -1016,16 +920,24 @@ fn set_selected_microphone(state: State<'_, AppState>, device_name: String) -> R
 
 #[tauri::command]
 fn get_selected_microphone(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    state.database.load_setting("selected_microphone")
+    state
+        .database
+        .load_setting("selected_microphone")
         .map_err(|e| format!("Failed to load microphone setting: {}", e))
 }
 
 #[tauri::command]
-fn set_selected_prompt_model(state: State<'_, AppState>, model: String, save_as_default: Option<bool>) -> Result<(), String> {
+fn set_selected_prompt_model(
+    state: State<'_, AppState>,
+    model: String,
+    save_as_default: Option<bool>,
+) -> Result<(), String> {
     let model = normalize_prompt_model(&model);
 
     // Save as current session model
-    state.database.save_setting("selected_prompt_model", &model)
+    state
+        .database
+        .save_setting("selected_prompt_model", &model)
         .map_err(|e| format!("Failed to save prompt model setting: {}", e))?;
 
     *state.prompt_mode.lock().unwrap() = if model == "transcribe-only" {
@@ -1037,11 +949,19 @@ fn set_selected_prompt_model(state: State<'_, AppState>, model: String, save_as_
     // Only save as user_prompt_model (for Ctrl+Shift+Space) when explicitly requested
     // This prevents Ctrl+B or Ctrl+Alt+Space from overwriting the user's preferred model
     if save_as_default.unwrap_or(false) && model != "transcribe-only" {
-        state.database.save_setting("user_prompt_model", &model)
+        state
+            .database
+            .save_setting("user_prompt_model", &model)
             .map_err(|e| format!("Failed to save user prompt model: {}", e))?;
-        println!("💾 Selected prompt model: {} (also saved as user_prompt_model)", model);
+        println!(
+            "💾 Selected prompt model: {} (also saved as user_prompt_model)",
+            model
+        );
     } else {
-        println!("💾 Selected prompt model: {} (user_prompt_model unchanged)", model);
+        println!(
+            "💾 Selected prompt model: {} (user_prompt_model unchanged)",
+            model
+        );
     }
     Ok(())
 }
@@ -1064,14 +984,21 @@ fn get_current_recording_mode(state: State<'_, AppState>) -> Result<String, Stri
     let model = match prompt_mode.as_deref() {
         Some("gpt-4o-mini") => "gpt-4o-mini".to_string(),
         Some("gpt-5.4") => "gpt-5.4".to_string(),
+        Some("gpt-6.1-sol") => "gpt-6.1-sol".to_string(),
         None => "transcribe-only".to_string(),
         Some(other) => {
-            println!("⚠️ Unknown prompt mode: {}, defaulting to transcribe-only", other);
+            println!(
+                "⚠️ Unknown prompt mode: {}, defaulting to transcribe-only",
+                other
+            );
             "transcribe-only".to_string()
         }
     };
 
-    println!("📋 get_current_recording_mode: prompt_mode={:?}, returning model={}", prompt_mode, model);
+    println!(
+        "📋 get_current_recording_mode: prompt_mode={:?}, returning model={}",
+        prompt_mode, model
+    );
     Ok(model)
 }
 
@@ -1081,7 +1008,10 @@ fn get_transcription_languages(state: State<'_, AppState>) -> Result<Vec<String>
 }
 
 #[tauri::command]
-fn set_transcription_languages(state: State<'_, AppState>, languages: Vec<String>) -> Result<Vec<String>, String> {
+fn set_transcription_languages(
+    state: State<'_, AppState>,
+    languages: Vec<String>,
+) -> Result<Vec<String>, String> {
     save_transcription_languages(&state.database, languages)
 }
 
@@ -1104,7 +1034,10 @@ fn get_game_mode_processes(state: State<'_, AppState>) -> Result<Vec<String>, St
 }
 
 #[tauri::command]
-fn set_game_mode_processes(state: State<'_, AppState>, processes: Vec<String>) -> Result<Vec<String>, String> {
+fn set_game_mode_processes(
+    state: State<'_, AppState>,
+    processes: Vec<String>,
+) -> Result<Vec<String>, String> {
     save_game_mode_processes(&state.database, processes)
 }
 
@@ -1130,7 +1063,10 @@ fn get_conversation_history(database: &db::Database) -> Vec<db::ConversationMess
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 fn emit_queue_updated(app: &AppHandle, database: &db::Database) {
@@ -1139,789 +1075,182 @@ fn emit_queue_updated(app: &AppHandle, database: &db::Database) {
     let _ = app.emit("queue-updated", count);
 }
 
-fn emit_queue_full(app: &AppHandle) {
-    tlog!("Queue full (3 items), dropping new item");
-    let _ = app.emit("queue-full", ());
+fn should_disable_auto_retry(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("insufficient_quota")
+        || [400, 401, 403, 404, 422]
+            .iter()
+            .any(|status| lower.starts_with(&format!("api error ({status}):")))
+        || lower.contains("billing_hard_limit_reached")
+        || lower.contains("invalid_api_key")
+        || lower.contains("incorrect api key")
+        || lower.contains("account_deactivated")
+        || lower.contains("model_not_found")
+}
+
+fn compact_queue_error(error: &str) -> String {
+    let single_line = error.replace(['\r', '\n'], " ");
+    let trimmed = single_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    let max_len = 240;
+    if trimmed.chars().count() <= max_len {
+        trimmed
+    } else {
+        format!("{}...", trimmed.chars().take(max_len).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    #[test]
+    fn queue_errors_are_unicode_safe_and_bounded() {
+        for text in [
+            format!("{}é final", "a".repeat(239)),
+            "á".repeat(500),
+            "erro\n com\r espaços".into(),
+        ] {
+            let result = super::compact_queue_error(&text);
+            assert!(result.chars().count() <= 243);
+            assert!(!result.contains('\n'));
+            assert!(!result.contains('\r'));
+        }
+    }
+    #[test]
+    fn permanent_quota_and_model_errors_stop_automatic_retry() {
+        assert!(super::should_disable_auto_retry(
+            "API error (429): insufficient_quota"
+        ));
+        assert!(super::should_disable_auto_retry(
+            "API error (404): model_not_found"
+        ));
+        assert!(!super::should_disable_auto_retry("api_timeout"));
+        assert!(super::should_disable_auto_retry(
+            "API error (401): api_error"
+        ));
+        assert!(!super::should_disable_auto_retry(
+            "API error (429): rate_limit_exceeded"
+        ));
+    }
 }
 
 /// Estimate cost in hundredths of a cent based on model and usage
 fn estimate_cost_cents(model: &str, duration_ms: Option<i64>, text: &str) -> i64 {
     match model {
-        "whisper" | "realtime" => {
+        "whisper" | "whisper-1" | "realtime" | "gpt-transcribe" => {
             // $0.006/min of audio
             let minutes = duration_ms.unwrap_or(0) as f64 / 60_000.0;
-            (minutes * 0.006 * 10_000.0) as i64
+            (minutes
+                * if model == "gpt-transcribe" {
+                    0.0045
+                } else {
+                    0.006
+                }
+                * 10_000.0) as i64
         }
         "gpt-4o-mini" => {
             // ~$0.60/1M output tokens, ~4 chars/token
             let tokens = text.len() as f64 / 4.0;
             (tokens * 0.60 / 1_000_000.0 * 10_000.0) as i64
         }
-        "gpt-5.4" => {
+        "gpt-5.4" | "gpt-6.1-sol" => {
             // ~$15/1M output tokens
             let tokens = text.len() as f64 / 4.0;
-            (tokens * 15.0 / 1_000_000.0 * 10_000.0) as i64
+            (tokens * if model == "gpt-6.1-sol" { 10.0 } else { 15.0 } / 1_000_000.0 * 10_000.0)
+                as i64
         }
         _ => 0,
     }
 }
 
 #[tauri::command]
-async fn send_text_prompt(state: State<'_, AppState>, app: AppHandle, prompt: String, model: String, image_data: Option<String>) -> Result<(), String> {
-    println!("{} 🤖 send_text_prompt called - model: {}, image: {}, prompt: {}", ts(), model, image_data.is_some(), prompt.chars().take(80).collect::<String>());
-
-    let openai = state.openai_client.clone();
-    let database = state.database.clone();
-    let last_transcription = state.last_transcription.clone();
-    let app_handle = app.clone();
-    let tts_enabled = state.tts_enabled.clone();
-    let tts_sink = state.tts_sink.clone();
-    let tts_stream_handle = state.tts_stream_handle.clone();
-    let tts_active = state.tts_active.clone();
-    let openai_for_tts = state.openai_client.clone();
-
-    // Load conversation history before spawning
-    let conv_history = get_conversation_history(&state.database);
-
+async fn send_text_prompt(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    prompt: String,
+    model: String,
+    image_data: Option<String>,
+) -> Result<(), String> {
+    let model = normalize_prompt_model(&model);
+    if model == "transcribe-only" || (prompt.trim().is_empty() && image_data.is_none()) {
+        return Err("Selecione um modelo e escreva um comando.".into());
+    }
+    if image_data.as_ref().is_some_and(|i| i.len() > 16_000_000) {
+        return Err("Imagem muito grande.".into());
+    }
+    let id = dictation::new_id();
+    let interruption = state.sessions.begin(&id, false)?;
+    let ctx = context(&state, app.clone());
+    let config = dictation::Config {
+        segments: segmentation::SegmentConfig::default(),
+        asr_model: "whisper-1".into(),
+        prompt_model: Some(model),
+        languages: vec![],
+        hint: None,
+        web_search: parse_bool_setting(
+            state
+                .database
+                .load_setting("web_search_enabled")
+                .ok()
+                .flatten(),
+            false,
+        ),
+        rate: 16000,
+        input_text: Some(prompt),
+        image_data,
+    };
+    let target = state.next_target.lock().unwrap().take();
+    let saved = state.database.create_session(&db::SessionRecord {
+        id: id.clone(),
+        status: "transcribing".into(),
+        created_at: now_ms(),
+        duration_ms: 0,
+        config: serde_json::to_string(&config).map_err(|e| e.to_string())?,
+        text: String::new(),
+        result: String::new(),
+    });
+    if saved.is_err() {
+        state.sessions.finished(&id);
+        return Err("Não foi possível preservar o comando.".into());
+    }
+    state
+        .sessions
+        .update(&app, &id, |s| s.phase = "processing_command".into());
+    let tts = (
+        state.tts_enabled.clone(),
+        state.tts_sink.clone(),
+        state.tts_stream_handle.clone(),
+        state.tts_active.clone(),
+    );
     tokio::spawn(async move {
-        match openai.send_prompt(&prompt, &model, &conv_history, image_data.as_deref()).await {
-            Ok(response) => {
-                println!("{} ✅ Text prompt response: {}", ts(), response.chars().take(80).collect::<String>());
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64;
-
-                // Save to transcription history (for Alt+Shift+Z)
-                let cost = estimate_cost_cents(&model, None, &response);
-                if let Err(e) = database.save_transcription(&response, timestamp, None, Some(&model), Some(cost), Some("prompt")) {
-                    eprintln!("❌ Failed to save text prompt response: {}", e);
-                }
-
-                // Save to conversation history
-                let _ = database.append_conversation("user", &prompt, timestamp - 1);
-                let _ = database.append_conversation("assistant", &response, timestamp);
-
-                *last_transcription.lock().unwrap() = Some(response.clone());
-
-                // Notify frontend to refresh history
-                if let Some(window) = app_handle.get_webview_window("main") {
-                    let _ = window.emit("history-updated", ());
-                }
-
-                // Auto-paste response
-                if let Err(e) = auto_paste_text(&app_handle, &response) {
-                    eprintln!("❌ Failed to paste text prompt response: {}", e);
-                }
-
-                // Notify frontend that response is ready (for notification sound)
-                if let Some(window) = app_handle.get_webview_window("main") {
-                    let _ = window.emit("response-ready", ());
-                }
-
-                // TTS (chunked)
-                if *tts_enabled.lock().unwrap() {
-                    tauri::async_runtime::spawn(play_tts_chunked(
-                        app_handle.clone(), response.clone(),
-                        openai_for_tts.clone(), tts_sink.clone(),
-                        tts_stream_handle.clone(), tts_active.clone(),
-                    ));
-                }
-            }
-            Err(e) => {
-                eprintln!("❌ Text prompt failed: {}", e);
-                let count = database.count_queue().unwrap_or(0);
-                if count < queue::MAX_QUEUE_SIZE {
-                    let _ = database.enqueue_item(
-                        "text-prompt",
-                        None,
-                        Some(&prompt),
-                        &model,
-                        now_ms(),
-                    );
-                    emit_queue_updated(&app_handle, &database);
-                } else {
-                    emit_queue_full(&app_handle);
-                }
+        let result = dictation::run_text(&ctx, &id, &config, interruption, target).await;
+        if let Err(error) = &result {
+            dictation::fail(&ctx, &id, error, "recoverable");
+        }
+        ctx.manager.finished(&id);
+        if let Ok(Some(text)) = result {
+            if *tts.0.lock().unwrap() {
+                tauri::async_runtime::spawn(play_tts_chunked(
+                    ctx.app.clone(),
+                    text,
+                    ctx.client.clone(),
+                    tts.1,
+                    tts.2,
+                    tts.3,
+                ));
             }
         }
     });
-
     Ok(())
 }
 
 #[tauri::command]
-async fn start_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> Result<String, String> {
-    let mut is_recording = state.is_recording.lock().unwrap();
-    if *is_recording {
-        return Err("Already recording".to_string());
-    }
-
-    println!("🎤 Starting realtime transcription...");
-    *is_recording = true;
-
-    // Mute system audio while recording (frontend already waited for start sound to finish)
-    if let Err(e) = system_audio::mute_system_audio() {
-        eprintln!("⚠️ Failed to mute system audio: {}", e);
-    }
-
-    // Set recording start time
-    *state.recording_start_time.lock().unwrap() = Some(Instant::now());
-
-    drop(is_recording);
-
-    // Reset current session transcript and speech state
-    *state.current_session_transcript.lock().unwrap() = String::new();
-    *state.speech_active.lock().unwrap() = false;
-    *state.last_speech_end.lock().unwrap() = None;
-    *state.last_transcription_time.lock().unwrap() = None;
-
-    // Get selected microphone from settings
-    let selected_mic = state.database.load_setting("selected_microphone")
-        .ok()
-        .flatten();
-
-    println!("🔍 DEBUG: selected_mic from DB = {:?}", selected_mic);
-
-    let realtime_client = state.realtime_client.clone();
-    let current_session_transcript = state.current_session_transcript.clone();
-    let is_recording_flag = state.is_recording.clone();
-    let recording_start = state.recording_start_time.clone();
-    let speech_active_for_listener = state.speech_active.clone();
-    let last_speech_end_for_listener = state.last_speech_end.clone();
-    let speech_active_for_stop = state.speech_active.clone();
-    let last_speech_end_for_stop = state.last_speech_end.clone();
-    let last_transcription_time_for_listener = state.last_transcription_time.clone();
-    let last_transcription_time_for_stop = state.last_transcription_time.clone();
-    let app_handle = app.clone();
-    let queue_dir_for_spawn = state.queue_dir.clone();
-    let database_for_spawn = state.database.clone();
-    let stop_handle_state = state.streaming_stop_handle.clone();
-    let realtime_transcription_hints = build_transcription_hints(&state.database);
-
-    tokio::spawn(async move {
-        // === 1. Start microphone FIRST (before WebSocket connect) ===
-        // This ensures audio is captured locally even if the connection fails.
-        let local_audio_buffer: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
-        let buffer_for_audio_thread = local_audio_buffer.clone();
-
-        let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<i16>>();
-        let is_recording_for_audio = is_recording_flag.clone();
-        let selected_mic_for_thread = selected_mic.clone();
-        let stop_handle_state_for_thread = stop_handle_state.clone();
-
-        println!("🔍 DEBUG: selected_mic_for_thread = {:?}", selected_mic_for_thread);
-
-        std::thread::spawn(move || {
-            println!("🔍 DEBUG: Inside thread, selected_mic = {:?}", selected_mic_for_thread);
-            let mut streaming_recorder = audio::StreamingAudioRecorder::new();
-
-            let mut local_audio_rx = match streaming_recorder.start_streaming(selected_mic_for_thread) {
-                Ok(rx) => rx,
-                Err(e) => {
-                    eprintln!("❌ Failed to start streaming: {}", e);
-                    *is_recording_for_audio.lock().unwrap() = false;
-                    return;
-                }
-            };
-
-            *stop_handle_state_for_thread.lock().unwrap() = Some(streaming_recorder.stop_handle());
-
-            loop {
-                if !*is_recording_for_audio.lock().unwrap() {
-                    println!("🛑 Audio thread detected stop signal");
-                    break;
-                }
-
-                match local_audio_rx.try_recv() {
-                    Ok(chunk) => {
-                        buffer_for_audio_thread.lock().unwrap().extend_from_slice(&chunk);
-                        // audio_tx.send may fail if receiver is dropped (e.g. connect failed) — that's ok
-                        let _ = audio_tx.send(chunk);
-                    }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                        println!("🛑 Audio channel disconnected");
-                        break;
-                    }
-                }
-            }
-
-            streaming_recorder.stop_streaming();
-            println!("🎤 Audio thread finished");
-        });
-
-        // Helper closure: save buffered audio to queue
-        let save_buffer_to_queue = |buffer: &Arc<Mutex<Vec<i16>>>, queue_dir: &std::path::PathBuf, db: &Arc<crate::db::Database>, app: &AppHandle| {
-            let buf = buffer.lock().unwrap();
-            if !buf.is_empty() {
-                println!("💾 Saving {} samples of buffered audio to queue", buf.len());
-                match queue::save_audio_i16_to_wav(&buf, 24000, queue_dir) {
-                    Ok(wav_path) => {
-                        let count = db.count_queue().unwrap_or(0);
-                        if count < queue::MAX_QUEUE_SIZE {
-                            let _ = db.enqueue_item(
-                                "realtime-audio",
-                                Some(wav_path.to_str().unwrap_or("")),
-                                None,
-                                "whisper",
-                                now_ms(),
-                            );
-                            emit_queue_updated(app, db);
-                        } else {
-                            emit_queue_full(app);
-                            queue::delete_wav_file(wav_path.to_str().unwrap_or(""));
-                        }
-                    }
-                    Err(e) => eprintln!("❌ Failed to save audio buffer: {}", e),
-                }
-            }
-        };
-
-        // === 2. Connect to Realtime API (mic is already recording) ===
-        match realtime_client.connect().await {
-            Ok(session) => {
-                println!("✅ Connected to Realtime API");
-
-                let connection_lost = Arc::new(Mutex::new(false));
-                let connection_lost_for_audio = connection_lost.clone();
-
-                // Configure session
-                if let Err(e) = session.configure_transcription(
-                    realtime_transcription_hints.0.as_deref(),
-                    realtime_transcription_hints.1.as_deref(),
-                ).await {
-                    eprintln!("❌ Failed to configure session: {}", e);
-                    *is_recording_flag.lock().unwrap() = false;
-                    if let Err(ue) = system_audio::unmute_system_audio() {
-                        eprintln!("⚠️ Failed to unmute on error: {}", ue);
-                    }
-                    // Wait briefly for audio thread to capture some samples before saving
-                    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                    save_buffer_to_queue(&local_audio_buffer, &queue_dir_for_spawn, &database_for_spawn, &app_handle);
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.emit("recording-error", format!("Falha na configuração: {}", e));
-                    }
-                    return;
-                }
-
-                // Clone session for sending audio
-                let session_clone = Arc::new(session);
-                let session_for_audio = session_clone.clone();
-                let session_for_commit = session_clone.clone();
-
-                // Spawn task to send audio chunks to WebSocket
-                let audio_task = tokio::spawn(async move {
-                    while let Some(audio_chunk) = audio_rx.recv().await {
-                        let audio_bytes = audio::pcm_to_bytes(&audio_chunk);
-                        if let Err(e) = session_for_audio.send_audio(&audio_bytes).await {
-                            eprintln!("❌ Failed to send audio: {}", e);
-                            *connection_lost_for_audio.lock().unwrap() = true;
-                            break;
-                        }
-                    }
-                    println!("🛑 Audio streaming finished");
-                });
-
-                // Clone for the event listener
-                let is_recording_flag_check = is_recording_flag.clone();
-                let app_for_listen = app_handle.clone();
-
-                // Listen for transcription events with periodic stop check
-                let listen_task = tokio::spawn(async move {
-                    let _ = session_clone
-                        .listen_for_events(|event| match event {
-                            realtime::TranscriptionEvent::Delta(delta) => {
-                                println!("📝 Delta: {}", delta.delta);
-
-                                // Accumulate in session transcript
-                                current_session_transcript.lock().unwrap().push_str(&delta.delta);
-
-                                // Emit delta to frontend for live display
-                                if let Some(window) = app_for_listen.get_webview_window("main") {
-                                    let _ = window.emit("transcription-delta", delta.delta.clone());
-                                }
-                            }
-                            realtime::TranscriptionEvent::Completed(_completed) => {
-                                // Don't auto-paste on each VAD completion - wait for user to stop
-                                println!("✨ Turn completed (VAD detected pause)");
-                                *last_transcription_time_for_listener.lock().unwrap() = Some(Instant::now());
-                            }
-                            realtime::TranscriptionEvent::SpeechStarted => {
-                                *speech_active_for_listener.lock().unwrap() = true;
-                                println!("🗣️ Speech tracking: ACTIVE");
-                            }
-                            realtime::TranscriptionEvent::SpeechStopped => {
-                                *speech_active_for_listener.lock().unwrap() = false;
-                                *last_speech_end_for_listener.lock().unwrap() = Some(Instant::now());
-                                println!("🔇 Speech tracking: STOPPED");
-                            }
-                        })
-                        .await;
-                });
-
-                // Poll for stop signal and check time limit
-                println!("👀 Monitoring for stop signal and time limit...");
-                let app_for_warning = app_handle.clone();
-                let mut warning_shown = false;
-                let mut auto_stop_triggered = false;
-
-                loop {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-                    let still_recording = *is_recording_flag_check.lock().unwrap();
-
-                    if !still_recording {
-                        println!("🛑 Stop signal detected (is_recording = false), waiting for last transcriptions...");
-                        break;
-                    }
-
-                    // Check recording duration
-                    if let Some(start_time) = *recording_start.lock().unwrap() {
-                        let elapsed = start_time.elapsed();
-
-                        // Show warning at 5 minutes
-                        if elapsed >= Duration::from_secs(5 * 60) && !warning_shown {
-                            warning_shown = true;
-                            println!("⚠️ [REALTIME] 5 seconds elapsed, showing warning...");
-                            println!("⚠️ [REALTIME] Elapsed time: {:?}", elapsed);
-
-                            if let Some(warning) = app_for_warning.get_webview_window("warning-widget") {
-                                println!("⚠️ [REALTIME] Found warning widget");
-
-                                if let Some(widget) = app_for_warning.get_webview_window("recording-widget") {
-                                    println!("⚠️ [REALTIME] Found recording widget");
-                                    if let Ok(widget_pos) = widget.outer_position() {
-                                        // Position warning above widget
-                                        let warning_x = widget_pos.x - 77; // Center warning above widget
-                                        let warning_y = widget_pos.y - 70; // 10px above widget
-                                        println!("⚠️ [REALTIME] Positioning warning at x:{}, y:{}", warning_x, warning_y);
-                                        match warning.set_position(PhysicalPosition::new(warning_x, warning_y)) {
-                                            Ok(_) => println!("⚠️ [REALTIME] ✅ Position set successfully"),
-                                            Err(e) => println!("⚠️ [REALTIME] ❌ Failed to set position: {}", e),
-                                        }
-                                    }
-                                } else {
-                                    println!("⚠️ [REALTIME] ❌ Recording widget not found for positioning");
-                                }
-
-                                match warning.show() {
-                                    Ok(_) => {
-                                        println!("⚠️ [REALTIME] ✅ Warning shown successfully");
-
-                                        // Auto-hide warning after 4 seconds
-                                        let warning_clone = warning.clone();
-                                        tokio::spawn(async move {
-                                            tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-                                            println!("⚠️ [REALTIME] Auto-hiding warning after 4 seconds");
-                                            match warning_clone.hide() {
-                                                Ok(_) => println!("⚠️ [REALTIME] ✅ Warning auto-hidden successfully"),
-                                                Err(e) => println!("⚠️ [REALTIME] ❌ Failed to auto-hide warning: {}", e),
-                                            }
-                                        });
-                                    },
-                                    Err(e) => println!("⚠️ [REALTIME] ❌ Failed to show warning: {}", e),
-                                }
-                            } else {
-                                println!("⚠️ [REALTIME] ❌ Warning widget not found!");
-                            }
-                        }
-
-                        // Auto-stop at 6 minutes
-                        if elapsed >= Duration::from_secs(6 * 60) && !auto_stop_triggered {
-                            auto_stop_triggered = true;
-                            println!("⏰ [REALTIME] 6 minutes limit reached, auto-stopping...");
-                            println!("⏰ [REALTIME] Elapsed time: {:?}", elapsed);
-
-                            // DON'T set is_recording = false here - let the frontend's stopRecording() do it
-                            // This prevents the "Not recording" error
-
-                            // Emit event to frontend to trigger full stop (which handles transcription save, paste, etc)
-                            if let Some(window) = app_for_warning.get_webview_window("main") {
-                                println!("⏰ [REALTIME] Emitting widget-stop-recording event to frontend");
-                                match window.emit("widget-stop-recording", ()) {
-                                    Ok(_) => println!("⏰ [REALTIME] ✅ Event emitted successfully"),
-                                    Err(e) => println!("⏰ [REALTIME] ❌ Failed to emit event: {}", e),
-                                }
-                            }
-
-                            // Hide recording widget
-                            if let Some(widget) = app_for_warning.get_webview_window("recording-widget") {
-                                println!("⏰ [REALTIME] Found recording widget, hiding it");
-                                match widget.hide() {
-                                    Ok(_) => println!("⏰ [REALTIME] ✅ Widget hidden successfully"),
-                                    Err(e) => println!("⏰ [REALTIME] ❌ Failed to hide widget: {}", e),
-                                }
-                            } else {
-                                println!("⏰ [REALTIME] ❌ Recording widget not found!");
-                            }
-
-                            // DON'T break - let the loop continue until frontend calls stop
-                            // which will set is_recording = false and trigger the break at line 478
-                        }
-                    }
-
-                    if listen_task.is_finished() {
-                        println!("🛑 Listen task finished unexpectedly (connection dropped)");
-                        audio_task.abort();
-                        listen_task.abort();
-                        *is_recording_flag.lock().unwrap() = false;
-                        if let Err(ue) = system_audio::unmute_system_audio() {
-                            eprintln!("⚠️ Failed to unmute on connection drop: {}", ue);
-                        }
-                        save_buffer_to_queue(&local_audio_buffer, &queue_dir_for_spawn, &database_for_spawn, &app_handle);
-                        if let Some(window) = app_handle.get_webview_window("main") {
-                            let _ = window.emit("recording-error", "Conexão perdida durante gravação".to_string());
-                        }
-                        println!("✅ Connection-drop cleanup complete");
-                        return;
-                    }
-                }
-
-                // Mic stopped (normal stop by user). Now:
-                // 1. Force-commit the audio buffer so API processes whatever was in-flight
-                // 2. Wait for transcription.completed to arrive (not speech_stopped which may not come)
-                // 3. Timeout quickly if nothing was in-flight
-                println!("🎙️ Mic stopped, committing buffer and waiting for final transcription...");
-
-                let stop_time = Instant::now();
-
-                // Remember if speech was active at stop time
-                let speech_was_active = *speech_active_for_stop.lock().unwrap();
-                let had_any_speech = last_speech_end_for_stop.lock().unwrap().is_some() || speech_was_active;
-                let transcription_before_stop = last_transcription_time_for_stop.lock().unwrap().clone();
-
-                if had_any_speech {
-                    // Explicitly commit the buffer - forces API to transcribe whatever audio is buffered
-                    println!("{} 🔔 Committing audio buffer to force transcription of in-flight audio...", ts());
-                    if let Err(e) = session_for_commit.commit_audio().await {
-                        println!("⚠️ commit_audio failed (may be ok if VAD already committed): {}", e);
-                    }
-
-                    // Wait for a NEW transcription.completed to arrive after our stop time
-                    // This is faster than waiting for speech_stopped
-                    let max_wait = Duration::from_millis(3500);
-                    loop {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
-
-                        let latest_transcription = last_transcription_time_for_stop.lock().unwrap().clone();
-                        let elapsed = stop_time.elapsed();
-
-                        // Check if a new transcription arrived after we stopped
-                        let new_transcription_arrived = match (latest_transcription, transcription_before_stop) {
-                            (Some(latest), Some(before)) => latest > before,
-                            (Some(_), None) => true,
-                            _ => false,
-                        };
-
-                        if new_transcription_arrived {
-                            println!("{} ✅ Final transcription arrived ({:.0}ms after stop)", ts(), elapsed.as_millis());
-                            // Small buffer to ensure the text is accumulated
-                            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-                            break;
-                        }
-
-                        if elapsed > max_wait {
-                            println!("{} ⏱️ No new transcription after {:.0}ms - was speech fully sent before stop?", ts(), elapsed.as_millis());
-                            break;
-                        }
-                    }
-                } else {
-                    println!("📭 No speech detected during recording, stopping immediately");
-                }
-
-                // Now abort the tasks
-                println!("🛑 Aborting audio and listen tasks...");
-                audio_task.abort();
-                listen_task.abort();
-
-                // If connection was lost during recording, save audio buffer to queue
-                if *connection_lost.lock().unwrap() {
-                    println!("⚠️ Connection was lost during recording, saving audio buffer to queue");
-                    save_buffer_to_queue(&local_audio_buffer, &queue_dir_for_spawn, &database_for_spawn, &app_handle);
-                }
-
-                println!("✅ Session cleanup complete");
-                *is_recording_flag.lock().unwrap() = false;
-            }
-            Err(e) => {
-                eprintln!("❌ Failed to connect to Realtime API: {}", e);
-                // Mic is already recording — DON'T stop it yet.
-                // Keep recording locally so audio is saved to queue.
-                // Wait for user to press Ctrl+Space (which sets is_recording=false).
-                println!("📡 No connection — recording locally until user stops...");
-                if let Some(window) = app_handle.get_webview_window("main") {
-                    let _ = window.emit("recording-offline", "Sem conexão — gravando localmente".to_string());
-                }
-
-                // Poll until the user stops recording
-                loop {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    if !*is_recording_flag.lock().unwrap() {
-                        break;
-                    }
-                }
-
-                // Now save the buffered audio to queue
-                if let Err(ue) = system_audio::unmute_system_audio() {
-                    eprintln!("⚠️ Failed to unmute on connect error: {}", ue);
-                }
-                save_buffer_to_queue(&local_audio_buffer, &queue_dir_for_spawn, &database_for_spawn, &app_handle);
-                if let Some(window) = app_handle.get_webview_window("main") {
-                    let _ = window.emit("recording-error", format!("Sem conexão — áudio salvo na fila: {}", e));
-                }
-            }
-        }
-    });
-
-    Ok("Realtime recording started".to_string())
-}
-
-#[tauri::command]
-async fn stop_realtime_recording(state: State<'_, AppState>, app: AppHandle) -> Result<String, String> {
-    println!("📞 stop_realtime_recording called");
-
-    {
-        let mut is_recording = state.is_recording.lock().unwrap();
-        if !*is_recording {
-            println!("⚠️ Not recording (is_recording already false)");
-            // Defensive unmute in case spawn exited without unmuting
-            drop(is_recording);
-            if let Err(e) = system_audio::unmute_system_audio() {
-                eprintln!("⚠️ Failed to defensive unmute: {}", e);
-            }
-            return Err("Not recording".to_string());
-        }
-
-        println!("⏹️ Setting is_recording = false...");
-        *is_recording = false;
-        println!("✅ is_recording is now false");
-    } // Drop lock before await
-
-    // Immediately release the microphone (don't wait for audio thread to notice)
-    if let Some(handle) = state.streaming_stop_handle.lock().unwrap().take() {
-        handle.stop();
-    }
-
-    // Restore system audio
-    if let Err(e) = system_audio::unmute_system_audio() {
-        eprintln!("⚠️ Failed to unmute system audio: {}", e);
-    }
-
-    // Capture recording duration for stats
-    let duration_ms = state.recording_start_time.lock().unwrap()
-        .map(|start| start.elapsed().as_millis() as i64);
-
-    // Wait for the internal spawn task to finish cleanup.
-    // The spawn signals completion by setting is_recording_flag=false (different from AppState.is_recording).
-    // We wait up to 5s for the spawn to finish its commit+transcription wait.
-    println!("⏳ Waiting for final transcription after stop...");
-    {
-        let wait_start = Instant::now();
-        let transcription_at_stop = state.last_transcription_time.lock().unwrap().clone();
-        let had_speech = state.last_speech_end.lock().unwrap().is_some()
-            || *state.speech_active.lock().unwrap();
-        let max_wait = Duration::from_millis(4500);
-
-        if had_speech {
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-                let latest = state.last_transcription_time.lock().unwrap().clone();
-                let new_arrived = match (latest, transcription_at_stop) {
-                    (Some(l), Some(b)) => l > b,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
-
-                if new_arrived {
-                    println!("{} ✅ Transcription received, reading transcript now", ts());
-                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                    break;
-                }
-
-                if wait_start.elapsed() > max_wait {
-                    println!("{} ⏱️ Timeout waiting for transcription ({:.0}ms)", ts(), wait_start.elapsed().as_millis());
-                    break;
-                }
-            }
-        } else {
-            println!("📭 No speech, proceeding immediately");
-        }
-    }
-
-    // Get accumulated transcript
-    println!("📝 Getting accumulated transcript...");
-    let transcript = state.current_session_transcript.lock().unwrap().clone();
-    println!("📝 Transcript length: {} characters", transcript.len());
-
-    // Check selected model in database FIRST (allows changing model during any recording)
-    let (_should_use_prompt, _selected_model) = {
-        let mut pm = state.prompt_mode.lock().unwrap();
-        let mode = pm.clone();
-        println!("🔍 DEBUG: prompt_mode at start of stop_realtime_recording = {:?}", mode);
-
-        // Always check the current selected model in database
-        let current_model = state.database.load_setting("selected_prompt_model")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| {
-                println!("⚠️ No model found in settings, defaulting to transcribe-only");
-                "transcribe-only".to_string()
-            });
-        println!("🔍 DEBUG: Current selected model in database = '{}'", current_model);
-
-        *pm = None; // Clear for next recording
-
-        // If model is "transcribe-only", treat as normal transcription (no prompt)
-        if current_model == "transcribe-only" {
-            println!("📝 Model is 'transcribe-only' - will NOT send to GPT");
-            (false, String::new())
-        } else {
-            println!("🤖 Model is '{}' - WILL send to GPT (regardless of how recording started)", current_model);
-            (true, current_model)
-        }
-    };
-
-    let (should_use_prompt, selected_model) = resolve_prompt_session(&state);
-    let _realtime_stop_transcription_hints = build_transcription_hints(&state.database);
-    println!("🎯 Final decision: should_use_prompt = {}, selected_model = '{}'", should_use_prompt, selected_model);
-
-    if !transcript.is_empty() {
-        // Check if we need to send to GPT first
-        if should_use_prompt {
-            println!("🤖 [REALTIME] Prompt mode active with model: {}", selected_model);
-
-            // Load conversation history before spawning
-            let conv_history = get_conversation_history(&state.database);
-
-            // Send transcript as prompt to GPT
-            let openai = state.openai_client.clone();
-            let database = state.database.clone();
-            let last_transcription = state.last_transcription.clone();
-            let app_clone = app.clone();
-            let transcript_clone = transcript.clone();
-            let tts_enabled_rt = state.tts_enabled.clone();
-            let tts_sink_rt = state.tts_sink.clone();
-            let tts_handle_rt = state.tts_stream_handle.clone();
-            let tts_active_rt = state.tts_active.clone();
-            let openai_tts_rt = state.openai_client.clone();
-
-            tokio::spawn(async move {
-                match openai.send_prompt(&transcript_clone, &selected_model, &conv_history, None).await {
-                    Ok(gpt_response) => {
-                        println!("✨ GPT Response: {}", gpt_response);
-
-                        // Save GPT response to database (not the transcript)
-                        let timestamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_millis() as i64;
-
-                        let cost = estimate_cost_cents(&selected_model, duration_ms, &gpt_response);
-                        if let Err(e) = database.save_transcription(&gpt_response, timestamp, duration_ms, Some(&selected_model), Some(cost), Some("prompt")) {
-                            eprintln!("❌ Failed to save to database: {}", e);
-                        }
-
-                        // Save to conversation history
-                        let _ = database.append_conversation("user", &transcript_clone, timestamp - 1);
-                        let _ = database.append_conversation("assistant", &gpt_response, timestamp);
-
-                        // Update last transcription with GPT response
-                        *last_transcription.lock().unwrap() = Some(gpt_response.clone());
-
-                        // Notify frontend
-                        if let Some(window) = app_clone.get_webview_window("main") {
-                            let _ = window.emit("history-updated", ());
-                        }
-
-                        // Auto-paste GPT response
-                        match auto_paste_text(&app_clone, &gpt_response) {
-                            Ok(_) => println!("✅ GPT response auto-pasted"),
-                            Err(e) => eprintln!("⚠️ Auto-paste failed: {}", e),
-                        }
-
-                        // Notification sound
-                        if let Some(window) = app_clone.get_webview_window("main") {
-                            let _ = window.emit("response-ready", ());
-                        }
-
-                        // TTS (chunked)
-                        if *tts_enabled_rt.lock().unwrap() {
-                            tauri::async_runtime::spawn(play_tts_chunked(
-                                app_clone.clone(), gpt_response.clone(),
-                                openai_tts_rt.clone(), tts_sink_rt.clone(),
-                                tts_handle_rt.clone(), tts_active_rt.clone(),
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("❌ GPT prompt error: {}", e);
-                        let count = database.count_queue().unwrap_or(0);
-                        if count < queue::MAX_QUEUE_SIZE {
-                            let _ = database.enqueue_item(
-                                "realtime-prompt",
-                                None,
-                                Some(&transcript_clone),
-                                &selected_model,
-                                now_ms(),
-                            );
-                            emit_queue_updated(&app_clone, &database);
-                        } else {
-                            emit_queue_full(&app_clone);
-                        }
-                    }
-                }
-            });
-        } else {
-            // Normal mode: just paste the transcript
-            // Save to database (single entry for entire session)
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
-
-            let cost = estimate_cost_cents("realtime", duration_ms, &transcript);
-            if let Err(e) = state.database.save_transcription(&transcript, timestamp, duration_ms, Some("realtime"), Some(cost), Some("transcription")) {
-                eprintln!("❌ Failed to save to database: {}", e);
-            }
-
-            // Update last transcription
-            *state.last_transcription.lock().unwrap() = Some(transcript.clone());
-
-            // Notify frontend
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.emit("history-updated", ());
-            }
-
-            // Auto-paste the full session transcript
-            let app_clone = app.clone();
-            let text_clone = transcript.clone();
-            let app_for_sound = app.clone();
-            std::thread::spawn(move || {
-                match auto_paste_text(&app_clone, &text_clone) {
-                    Ok(_) => println!("✅ Session transcript auto-pasted"),
-                    Err(e) => eprintln!("⚠️ Auto-paste failed: {}", e),
-                }
-
-                // Notification sound
-                if let Some(window) = app_for_sound.get_webview_window("main") {
-                    let _ = window.emit("response-ready", ());
-                }
-
-                // TTS skipped for transcribe-only (would just repeat what user said)
-            });
-        }
-    }
-
-    Ok("Realtime recording stopped".to_string())
-}
-
-#[tauri::command]
-async fn get_statistics(state: State<'_, AppState>, from_ts: i64, to_ts: i64) -> Result<db::StatsData, String> {
-    state.database.get_stats(from_ts, to_ts)
+async fn get_statistics(
+    state: State<'_, AppState>,
+    from_ts: i64,
+    to_ts: i64,
+) -> Result<db::StatsData, String> {
+    state
+        .database
+        .get_stats(from_ts, to_ts)
         .map_err(|e| format!("Failed to get stats: {}", e))
 }
 
@@ -1931,9 +1260,15 @@ fn get_tts_enabled(state: State<'_, AppState>) -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn set_tts_enabled(state: State<'_, AppState>, app: AppHandle, enabled: bool) -> Result<(), String> {
+fn set_tts_enabled(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    enabled: bool,
+) -> Result<(), String> {
     *state.tts_enabled.lock().unwrap() = enabled;
-    state.database.save_setting("tts_enabled", if enabled { "true" } else { "false" })
+    state
+        .database
+        .save_setting("tts_enabled", if enabled { "true" } else { "false" })
         .map_err(|e| format!("Failed to save TTS setting: {}", e))?;
     println!("🔊 TTS {}", if enabled { "enabled" } else { "disabled" });
     // Notify frontend
@@ -1995,14 +1330,25 @@ async fn retry_pending_queue(state: State<'_, AppState>, app: AppHandle) -> Resu
     let app_handle = app.clone();
 
     tokio::spawn(async move {
-        process_retry_queue(database, openai, last_transcription, app_handle).await;
+        process_retry_queue(database, openai, last_transcription, app_handle, true).await;
     });
 
     Ok(())
 }
 
 #[tauri::command]
-async fn delete_single_queue_item(state: State<'_, AppState>, app: AppHandle, id: i64) -> Result<(), String> {
+async fn delete_single_queue_item(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    id: i64,
+) -> Result<(), String> {
+    if !state
+        .database
+        .claim_queue_item(id, true)
+        .map_err(|e| e.to_string())?
+    {
+        return Err("Item em processamento.".into());
+    }
     // Find item to delete its WAV file if it has one
     let items = state.database.load_queue().map_err(|e| e.to_string())?;
     if let Some(item) = items.iter().find(|i| i.id == id) {
@@ -2010,24 +1356,38 @@ async fn delete_single_queue_item(state: State<'_, AppState>, app: AppHandle, id
             queue::delete_wav_file(path);
         }
     }
-    state.database.delete_queue_item(id).map_err(|e| e.to_string())?;
+    state
+        .database
+        .delete_queue_item(id)
+        .map_err(|e| e.to_string())?;
     emit_queue_updated(&app, &state.database);
     Ok(())
 }
 
 #[tauri::command]
-async fn retry_single_queue_item(state: State<'_, AppState>, app: AppHandle, id: i64) -> Result<(), String> {
+async fn retry_single_queue_item(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    id: i64,
+) -> Result<(), String> {
     let database = state.database.clone();
     let openai = state.openai_client.clone();
     let last_transcription = state.last_transcription.clone();
     let app_handle = app.clone();
 
     let items = database.load_queue().map_err(|e| e.to_string())?;
-    let item = items.into_iter().find(|i| i.id == id)
+    let item = items
+        .into_iter()
+        .find(|i| i.id == id)
         .ok_or_else(|| "Item não encontrado na fila".to_string())?;
 
     tokio::spawn(async move {
-        let result = process_single_queue_item(&item, &database, &openai, &last_transcription, &app_handle).await;
+        if !database.claim_queue_item(item.id, true).unwrap_or(false) {
+            return;
+        }
+        let result =
+            process_single_queue_item(&item, &database, &openai, &last_transcription, &app_handle)
+                .await;
         handle_queue_item_result(result, &item, &database, &app_handle);
     });
 
@@ -2036,34 +1396,42 @@ async fn retry_single_queue_item(state: State<'_, AppState>, app: AppHandle, id:
 
 #[tauri::command]
 async fn play_queue_audio(state: State<'_, AppState>, audio_path: String) -> Result<(), String> {
-    let file = std::fs::File::open(&audio_path)
-        .map_err(|e| format!("Erro ao abrir arquivo: {}", e))?;
-    let buf = std::io::BufReader::new(file);
-    let source = rodio::Decoder::new(buf)
-        .map_err(|e| format!("Erro ao decodificar áudio: {}", e))?;
-
-    // Stop any previous playback
+    let path = std::fs::canonicalize(&audio_path).map_err(|_| "Áudio indisponível.".to_string())?;
+    let root =
+        std::fs::canonicalize(&state.queue_dir).map_err(|_| "Fila indisponível.".to_string())?;
+    if !path.starts_with(&root)
+        || path
+            .extension()
+            .is_none_or(|e| !e.eq_ignore_ascii_case("wav"))
     {
-        let mut sg = state.tts_sink.lock().unwrap();
-        if let Some(s) = sg.take() { s.stop(); }
+        return Err("Áudio fora da fila.".into());
     }
-
-    // Open fresh output stream to use current default device
-    let (_stream, handle) = rodio::OutputStream::try_default()
-        .map_err(|e| format!("Erro ao abrir saída de áudio: {}", e))?;
-
-    let sink = rodio::Sink::try_new(&handle)
-        .map_err(|e| format!("Erro ao criar player: {}", e))?;
-    sink.append(source);
-
-    // Wait for playback to finish (otherwise _stream drops and audio cuts)
-    sink.sleep_until_end();
-
-    println!("🔊 Finished playing queue audio: {}", audio_path);
+    let sink_state = state.tts_sink.clone();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let (_stream, handle) = rodio::OutputStream::try_default().map_err(|_| ())?;
+            let file = std::fs::File::open(path).map_err(|_| ())?;
+            let decoder = rodio::Decoder::new(std::io::BufReader::new(file)).map_err(|_| ())?;
+            let sink = rodio::Sink::try_new(&handle).map_err(|_| ())?;
+            sink.append(decoder);
+            *sink_state.lock().map_err(|_| ())? = Some(sink);
+            while sink_state
+                .lock()
+                .map_err(|_| ())?
+                .as_ref()
+                .is_some_and(|s| !s.empty())
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok::<_, ()>(())
+        })();
+        if result.is_err() {
+            diagnostics::event("playback_failed", serde_json::json!({}));
+        }
+    });
     Ok(())
 }
 
-/// Process a single queue item: retry the API call
 async fn process_single_queue_item(
     item: &db::PendingQueueItem,
     database: &Arc<db::Database>,
@@ -2071,35 +1439,57 @@ async fn process_single_queue_item(
     last_transcription: &Arc<Mutex<Option<String>>>,
     app: &AppHandle,
 ) -> Result<(), String> {
+    if let Some(text) = database
+        .load_result_for_source(&format!("queue:{}", item.id))
+        .map_err(|e| e.to_string())?
+    {
+        *last_transcription.lock().unwrap() = Some(text);
+        return Ok(());
+    }
     match item.mode.as_str() {
         "whisper-transcribe" => {
-            let path = item.audio_path.as_ref().ok_or("No audio path for whisper-transcribe item")?;
-            let audio = queue::read_wav_to_f32(path)?;
+            let path = item
+                .audio_path
+                .as_ref()
+                .ok_or("No audio path for whisper-transcribe item")?;
+            let (audio, sample_rate) = queue::read_wav_to_f32_with_rate(path)?;
             let transcription_hints = build_transcription_hints(database);
             let text = openai
                 .transcribe_audio(
                     audio,
-                    48000,
+                    sample_rate,
                     transcription_hints.0.as_deref(),
                     transcription_hints.1.as_deref(),
                 )
                 .await?;
-            tlog!("Queue retry: whisper-transcribe succeeded for id={}", item.id);
-            let ts = now_ms();
-            let cost = estimate_cost_cents("whisper", None, &text);
-            let _ = database.save_transcription(&text, ts, None, Some("whisper"), Some(cost), Some("transcription"));
+            tlog!(
+                "Queue retry: whisper-transcribe succeeded for id={}",
+                item.id
+            );
+            database
+                .save_result_once(
+                    &format!("queue:{}", item.id),
+                    &text,
+                    None,
+                    "whisper-1",
+                    "transcription",
+                )
+                .map_err(|e| e.to_string())?;
             *last_transcription.lock().unwrap() = Some(text.clone());
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.emit("history-updated", ());
             }
-            let _ = auto_paste_text(app, &text);
+
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.emit("response-ready", ());
             }
             Ok(())
         }
         "realtime-audio" => {
-            let path = item.audio_path.as_ref().ok_or("No audio path for realtime-audio item")?;
+            let path = item
+                .audio_path
+                .as_ref()
+                .ok_or("No audio path for realtime-audio item")?;
             let (audio, sample_rate) = queue::read_wav_to_f32_with_rate(path)?;
             let transcription_hints = build_transcription_hints(database);
             let text = openai
@@ -2111,34 +1501,52 @@ async fn process_single_queue_item(
                 )
                 .await?;
             tlog!("Queue retry: realtime-audio succeeded for id={}", item.id);
-            let ts = now_ms();
-            let cost = estimate_cost_cents("whisper", None, &text);
-            let _ = database.save_transcription(&text, ts, None, Some("whisper"), Some(cost), Some("transcription"));
+            database
+                .save_result_once(
+                    &format!("queue:{}", item.id),
+                    &text,
+                    None,
+                    "whisper-1",
+                    "transcription",
+                )
+                .map_err(|e| e.to_string())?;
             *last_transcription.lock().unwrap() = Some(text.clone());
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.emit("history-updated", ());
             }
-            let _ = auto_paste_text(app, &text);
+
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.emit("response-ready", ());
             }
             Ok(())
         }
         "whisper-prompt" | "text-prompt" | "realtime-prompt" => {
-            let text = item.prompt_text.as_ref().ok_or("No prompt text for queue item")?;
+            let text = item
+                .prompt_text
+                .as_ref()
+                .ok_or("No prompt text for queue item")?;
             let conv_history = get_conversation_history(database);
-            let response = openai.send_prompt(text, &item.model, &conv_history, None).await?;
+            let response = openai
+                .send_prompt(text, &item.model, &conv_history, None)
+                .await?;
             tlog!("Queue retry: {} succeeded for id={}", item.mode, item.id);
             let ts = now_ms();
-            let cost = estimate_cost_cents(&item.model, None, &response);
-            let _ = database.save_transcription(&response, ts, None, Some(&item.model), Some(cost), Some("prompt"));
+            database
+                .save_result_once(
+                    &format!("queue:{}", item.id),
+                    &response,
+                    None,
+                    &item.model,
+                    "prompt",
+                )
+                .map_err(|e| e.to_string())?;
             let _ = database.append_conversation("user", text, ts - 1);
             let _ = database.append_conversation("assistant", &response, ts);
             *last_transcription.lock().unwrap() = Some(response.clone());
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.emit("history-updated", ());
             }
-            let _ = auto_paste_text(app, &response);
+
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.emit("response-ready", ());
             }
@@ -2166,7 +1574,9 @@ fn handle_queue_item_result(
         }
         Err(e) => {
             eprintln!("❌ Queue retry failed for id={}: {}", item.id, e);
-            let _ = database.increment_retry_count(item.id);
+            let disable_auto_retry = should_disable_auto_retry(&e);
+            let summarized_error = compact_queue_error(&e);
+            let _ = database.record_queue_failure(item.id, &summarized_error, disable_auto_retry);
             emit_queue_updated(app, database);
         }
     }
@@ -2178,12 +1588,8 @@ async fn process_retry_queue(
     openai: Arc<openai::OpenAIClient>,
     last_transcription: Arc<Mutex<Option<String>>>,
     app: AppHandle,
+    include_blocked: bool,
 ) {
-    if !queue::is_online() {
-        tlog!("Queue retry: offline, skipping");
-        return;
-    }
-
     let items = match database.load_queue() {
         Ok(items) => items,
         Err(e) => {
@@ -2196,10 +1602,30 @@ async fn process_retry_queue(
         return;
     }
 
+    let items: Vec<_> = if include_blocked {
+        items
+    } else {
+        items
+            .into_iter()
+            .filter(|item| !item.auto_retry_disabled)
+            .collect()
+    };
+
+    if items.is_empty() {
+        return;
+    }
+
     tlog!("Queue retry: processing {} items", items.len());
 
     for item in items {
-        let result = process_single_queue_item(&item, &database, &openai, &last_transcription, &app).await;
+        if !database
+            .claim_queue_item(item.id, include_blocked)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let result =
+            process_single_queue_item(&item, &database, &openai, &last_transcription, &app).await;
         handle_queue_item_result(result, &item, &database, &app);
     }
 }
@@ -2207,24 +1633,54 @@ async fn process_retry_queue(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Resolve app data directory (stable across launch methods)
-    let app_data_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| std::env::current_dir().expect("Failed to get current directory"))
-        .join("com.dicta.app");
+    let app_data_dir = std::env::var_os("DICTA_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::data_local_dir()
+                .unwrap_or_else(|| std::env::current_dir().expect("app data directory"))
+                .join(if cfg!(debug_assertions) {
+                    "com.dicta.app-dev"
+                } else {
+                    "com.dicta.app"
+                })
+        });
     std::fs::create_dir_all(&app_data_dir).ok();
+    let _instance = match lifecycle::Instance::acquire(&app_data_dir) {
+        Ok(lock) => lock,
+        Err(_) => {
+            eprintln!("Dicta: este perfil já está aberto ou indisponível.");
+            return;
+        }
+    };
 
+    diagnostics::init(app_data_dir.join("logs"));
+    diagnostics::event(
+        "startup",
+        serde_json::json!({"version":env!("CARGO_PKG_VERSION")}),
+    );
     // Load .env file: try app data dir first, then current dir (for dev mode)
     let env_path = app_data_dir.join(".env");
     if env_path.exists() {
         dotenv::from_path(&env_path).ok();
     } else {
-        dotenv::dotenv().ok();
+        if std::env::var("OPENAI_API_KEY").is_err() {
+            if let Some(root) = dirs::data_local_dir() {
+                dotenv::from_path(root.join("com.dicta.app/.env")).ok();
+            }
+        }
+        if std::env::var("OPENAI_API_KEY").is_err() {
+            dotenv::dotenv().ok();
+        }
     }
 
     // Load OpenAI API key from environment
     let api_key = match std::env::var("OPENAI_API_KEY") {
         Ok(key) => key,
         Err(_) => {
-            eprintln!("❌ OPENAI_API_KEY not found. Place a .env file in: {}", app_data_dir.display());
+            eprintln!(
+                "❌ OPENAI_API_KEY not found. Place a .env file in: {}",
+                app_data_dir.display()
+            );
             // Show a native error dialog since there's no console in release mode
             #[cfg(not(debug_assertions))]
             {
@@ -2245,35 +1701,19 @@ pub fn run() {
     let db_path = app_data_dir.join("dicta.db");
     println!("📁 Database: {}", db_path.display());
 
-    let database = Arc::new(
-        db::Database::new(db_path)
-            .expect("Failed to initialize database")
-    );
+    let database = Arc::new(db::Database::new(db_path).expect("Failed to initialize database"));
 
     // Load TTS preference from DB
-    let tts_default = database.load_setting("tts_enabled")
+    let tts_default = database
+        .load_setting("tts_enabled")
         .ok()
         .flatten()
         .map(|v| v == "true")
         .unwrap_or(false);
-    let use_realtime_default = parse_bool_setting(
-        database.load_setting("use_realtime").ok().flatten(),
-        DEFAULT_USE_REALTIME,
-    );
+    let _ = database.recover_interrupted_sessions();
 
-    // Initialize audio output stream for TTS
-    // Leak the OutputStream so it lives for the app's lifetime (it's not Send, can't go in AppState)
-    let tts_stream_handle_val = match rodio::OutputStream::try_default() {
-        Ok((stream, handle)) => {
-            // Leak the stream so it stays alive forever (app-lifetime resource)
-            std::mem::forget(stream);
-            Some(handle)
-        }
-        Err(e) => {
-            eprintln!("⚠️ Failed to initialize audio output for TTS: {}", e);
-            None
-        }
-    };
+    // Playback threads open the current device on demand, including after resume.
+    let tts_stream_handle_val = None;
 
     // Initialize queue directory
     let queue_dir = app_data_dir.join("queue");
@@ -2281,27 +1721,23 @@ pub fn run() {
     println!("📁 Queue directory: {}", queue_dir.display());
 
     // Initialize app state
+    let session_dir = app_data_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).ok();
     let app_state = AppState {
-        audio_recorder: Arc::new(Mutex::new(audio::AudioRecorder::new())),
-        openai_client: Arc::new(openai::OpenAIClient::new(api_key.clone())),
-        realtime_client: Arc::new(realtime::RealtimeClient::new(api_key)),
+        openai_client: Arc::new(openai::OpenAIClient::new(api_key)),
         database,
+        sessions: Arc::new(dictation::Manager::new()),
+        session_dir,
+        next_target: Arc::new(Mutex::new(None)),
         is_recording: Arc::new(Mutex::new(false)),
-        use_realtime: Arc::new(Mutex::new(use_realtime_default)),
         prompt_mode: Arc::new(Mutex::new(None)),
-        current_session_transcript: Arc::new(Mutex::new(String::new())),
         last_transcription: Arc::new(Mutex::new(None)),
-        paste_in_progress: Arc::new(Mutex::new(false)),
-        recording_start_time: Arc::new(Mutex::new(None)),
-        speech_active: Arc::new(Mutex::new(false)),
-        last_speech_end: Arc::new(Mutex::new(None)),
-        last_transcription_time: Arc::new(Mutex::new(None)),
         tts_enabled: Arc::new(Mutex::new(tts_default)),
         tts_sink: Arc::new(Mutex::new(None)),
         tts_stream_handle: Arc::new(Mutex::new(tts_stream_handle_val)),
         tts_active: Arc::new(Mutex::new(false)),
         queue_dir,
-        streaming_stop_handle: Arc::new(Mutex::new(None)),
+        shortcut_errors: Arc::new(Mutex::new(Vec::new())),
     };
 
     // Debounce: prevent multiple triggers when keys are held down
@@ -2331,8 +1767,23 @@ pub fn run() {
                         }
                     }
 
+                    if let Some(state)=app.try_state::<AppState>(){
+                        if !*state.is_recording.lock().unwrap() {
+                            *state.next_target.lock().unwrap()=delivery::capture_target();
+                        }
+                    }
+                    diagnostics::event("hotkey",serde_json::json!({"shortcut":format!("{:?}",shortcut)}));
                     // Check which shortcut was pressed
                     let shortcut_str = format!("{:?}", shortcut);
+
+                    if let Some(state)=app.try_state::<AppState>(){if shortcut_str.contains("Space") && state.sessions.busy() && !*state.is_recording.lock().unwrap(){return;}}
+                    #[cfg(debug_assertions)]
+                    if std::env::var_os("DICTA_TEST_HOTKEYS").is_some() && shortcut_str.contains("Space") {
+                        if let Some(state)=app.try_state::<AppState>(){if !*state.is_recording.lock().unwrap(){let _=state.database.save_setting("selected_prompt_model","transcribe-only");}}
+                        if let Some(widget)=app.get_webview_window("recording-widget"){let _=widget.show();}
+                        toggle_recording_from_hotkey(app.clone());
+                        return;
+                    }
 
                     if shortcut_str.contains("Space") && shortcut_str.contains("CONTROL") && shortcut_str.contains("SHIFT") {
                         // Ctrl+Shift+Space: Toggle recording with selected prompt model
@@ -2363,7 +1814,7 @@ pub fn run() {
                                             if let Some(monitor) = monitor {
                                                 let screen_size = monitor.size();
                                                 let widget_width = 155;
-                                                let widget_height = 120; // Height increased for combo box
+                                                let widget_height = 200; // Height increased for combo box
                                                 let bottom_margin = 200; // More space from taskbar
 
                                                 let x = (screen_size.width as i32 - widget_width) / 2;
@@ -2388,9 +1839,7 @@ pub fn run() {
                             }
 
                             // Emit event to frontend
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.emit("toggle-recording", ());
-                            }
+                            toggle_recording_from_hotkey(app.clone());
                         } else {
                             println!("⏭️ Ctrl+Shift+Space ignored (debounce)");
                         }
@@ -2443,9 +1892,7 @@ pub fn run() {
                             }
 
                             // Emit event to frontend
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.emit("toggle-recording", ());
-                            }
+                            toggle_recording_from_hotkey(app.clone());
                         } else {
                             println!("⏭️ Ctrl+Alt+Space ignored (debounce)");
                         }
@@ -2503,9 +1950,7 @@ pub fn run() {
                             }
 
                             // Emit event to frontend
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.emit("toggle-recording", ());
-                            }
+                            toggle_recording_from_hotkey(app.clone());
                         } else {
                             println!("⏭️ Ctrl+Space ignored (debounce - too fast)");
                         }
@@ -2579,8 +2024,6 @@ pub fn run() {
                                 // Read last message aloud (chunked)
                                 let last_text = state.last_transcription.lock().unwrap().clone();
                                 if let Some(text) = last_text {
-                                    let preview: String = text.chars().take(50).collect();
-                                    println!("🔊 Reading last message via TTS: {}...", preview);
                                     let openai = state.openai_client.clone();
                                     let tts_sink = state.tts_sink.clone();
                                     let tts_handle = state.tts_stream_handle.clone();
@@ -2595,65 +2038,16 @@ pub fn run() {
                             }
                         }
                     } else if shortcut_str.contains("KeyZ") {
-                        // Alt+Shift+Z: Get last transcription from history and paste it
-                        tlog!("🔥 Hotkey pressed: Alt+Shift+Z");
-
-                        // Get app state
-                        if let Some(state) = app.try_state::<AppState>() {
-                            // Check if paste is already in progress
-                            let mut paste_in_progress = state.paste_in_progress.lock().unwrap();
-                            if *paste_in_progress {
-                                println!("⏭️ Alt+Shift+Z ignored (paste already in progress)");
-                                return;
-                            }
-
-                            // Check debounce (increased to account for the paste operation duration)
-                            let mut last_paste = last_paste_trigger_clone.lock().unwrap();
-                            let now = Instant::now();
-                            // Total paste operation takes ~600ms (delay) + ~300ms (restore) = ~900ms
-                            // We use 1000ms debounce to be safe
-                            if now.duration_since(*last_paste) < Duration::from_millis(1000) {
-                                println!("⏭️ Alt+Shift+Z ignored (debounce - paste takes ~900ms)");
-                                return;
-                            }
-
-                            *last_paste = now;
-                            drop(last_paste); // Release debounce lock
-
-                            // Get last transcription from database
-                            match state.database.load_transcriptions() {
-                                Ok(history) if !history.is_empty() => {
-                                    let last_entry = &history[0]; // First entry is most recent
-                                    println!("📋 Pasting last transcription from history: {}", last_entry.text);
-                                    let text_clone = last_entry.text.clone();
-
-                                    // Mark paste as in progress
-                                    *paste_in_progress = true;
-                                    drop(paste_in_progress); // Release lock before spawning thread
-
-                                    let app_handle = app.app_handle().clone();
-                                    let paste_flag = state.paste_in_progress.clone();
-
-                                    // auto_paste_text handles: save clipboard, copy text, paste (Ctrl+V), restore clipboard
-                                    std::thread::spawn(move || {
-                                        // Small delay to ensure clipboard is ready
-                                        std::thread::sleep(std::time::Duration::from_millis(100));
-
-                                        if let Err(e) = auto_paste_text(&app_handle, &text_clone) {
-                                            eprintln!("❌ Failed to paste: {}", e);
-                                        }
-                                        // Mark paste as complete
-                                        *paste_flag.lock().unwrap() = false;
-                                        println!("✅ Paste operation completed");
-                                    });
-                                }
-                                _ => {
-                                    *paste_in_progress = false; // Reset flag if no transcription available
-                                    println!("⚠️ No transcription available to paste");
-                                }
+                        let mut last=last_paste_trigger_clone.lock().unwrap();
+                        if last.elapsed()<Duration::from_millis(1000){return;}*last=Instant::now();drop(last);
+                        if let Some(state)=app.try_state::<AppState>() {
+                            if let Ok(Some(entry))=state.database.load_latest_transcription(){
+                                let target=delivery::capture_target();let app=app.clone();
+                                std::thread::spawn(move||delivery::deliver(&app,&entry.text,target));
                             }
                         }
                     }
+
                 })
                 .build()
         )
@@ -2665,8 +2059,8 @@ pub fn run() {
             get_last_transcription,
             get_transcription_history,
             copy_to_clipboard,
-            start_realtime_recording,
-            stop_realtime_recording,
+            get_session_state,get_segment_config,set_segment_config,get_asr_model,set_asr_model,
+            get_recoverable_sessions,retry_session,discard_session,paste_last_transcription,get_build_info,get_shortcut_errors,recover_runtime,get_web_search_enabled,set_web_search_enabled,
             set_use_realtime,
             get_use_realtime,
             list_microphones,
@@ -2695,10 +2089,14 @@ pub fn run() {
             play_queue_audio
         ])
         .setup(|app| {
+            lifecycle::install(app.handle())?;
+            if cfg!(debug_assertions) && std::env::var_os("DICTA_SHOW_MAIN").is_some(){if let Some(w)=app.get_webview_window("main"){let _=w.set_title("Dicta — teste isolado");let _=w.show();}}
+            if let Some(w)=app.get_webview_window("recording-widget"){let _=w.set_focusable(false);}
             // Create tray menu
             let show_item = MenuItem::with_id(app, "show", "Abrir Dicta", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Sair", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let recover_item=MenuItem::with_id(app,"recover","Recuperar sessão e colagem",true,None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &recover_item, &quit_item])?;
 
             // Build system tray
             let _tray = TrayIconBuilder::with_id("main-tray")
@@ -2711,6 +2109,10 @@ pub fn run() {
                             let _ = window.show();
                             let _ = window.set_focus();
                         }
+                    }
+                    "recover" => {
+                        let state=app.state::<AppState>();delivery::invalidate();state.sessions.interrupt(app,false);
+                        let _=system_audio::unmute_system_audio();let _=app.emit("runtime-resumed",());
                     }
                     "quit" => {
                         app.exit(0);
@@ -2754,9 +2156,12 @@ pub fn run() {
                 Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyS),
                 Shortcut::new(Some(Modifiers::ALT | Modifiers::SHIFT), Code::KeyS),
             ];
+            let shortcuts=if cfg!(debug_assertions) && std::env::var_os("DICTA_TEST_HOTKEYS").is_some(){vec![Shortcut::new(Some(Modifiers::CONTROL|Modifiers::ALT|Modifiers::SHIFT),Code::Space)]}else{shortcuts.to_vec()};
             for shortcut in &shortcuts {
+                if std::env::var_os("DICTA_DISABLE_HOTKEYS").is_some(){continue;}
                 if let Err(e) = app.global_shortcut().register(*shortcut) {
-                    eprintln!("⚠️ Failed to register shortcut {:?}: {}", shortcut, e);
+                    diagnostics::event("shortcut_registration_failed",serde_json::json!({"shortcut":format!("{:?}",shortcut),"error":e.to_string()}));
+                    app.state::<AppState>().shortcut_errors.lock().unwrap().push(shortcut.to_string());
                 }
             }
 
@@ -2776,6 +2181,7 @@ pub fn run() {
                             openai_for_queue.clone(),
                             last_tx_for_queue.clone(),
                             app_for_queue.clone(),
+                            false,
                         ).await;
                     }
                 });

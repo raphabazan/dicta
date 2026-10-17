@@ -1,6 +1,6 @@
 {
   "productName": "Dicta",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "identifier": "com.dicta.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -37,7 +37,7 @@
         "title": "Recording",
         "url": "widget.html",
         "width": 155,
-        "height": 150,
+        "height": 200,
         "resizable": false,
         "fullscreen": false,
         "visible": false,
@@ -112,12 +112,19 @@
       }
     ],
     "security": {
-      "csp": null,
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost data: blob:; media-src 'self' data: blob:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'",
       "capabilities": [
         {
           "identifier": "main-capability",
           "description": "Capability for main window",
-          "windows": ["main", "recording-widget", "warning-widget", "prompt-input", "tts-widget", "tts-toast"],
+          "windows": [
+            "main",
+            "recording-widget",
+            "warning-widget",
+            "prompt-input",
+            "tts-widget",
+            "tts-toast"
+          ],
           "permissions": [
             "core:event:allow-listen",
             "core:event:allow-unlisten",
@@ -137,10 +144,26 @@
             "process:allow-restart"
           ],
           "commands": {
-            "allow": ["start_recording_audio", "stop_recording_audio", "cancel_recording", "stop_tts_playback", "get_tts_enabled", "set_tts_enabled", "get_selected_prompt_model", "set_selected_prompt_model", "get_queue_count", "get_queue_items", "retry_pending_queue", "delete_single_queue_item", "retry_single_queue_item", "play_queue_audio"]
+            "allow": [
+              "start_recording_audio",
+              "stop_recording_audio",
+              "cancel_recording",
+              "stop_tts_playback",
+              "get_tts_enabled",
+              "set_tts_enabled",
+              "get_selected_prompt_model",
+              "set_selected_prompt_model",
+              "get_queue_count",
+              "get_queue_items",
+              "retry_pending_queue",
+              "delete_single_queue_item",
+              "retry_single_queue_item",
+              "play_queue_audio"
+            ]
           }
         }
-      ]
+      ],
+      "devCsp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420; object-src 'none'"
     }
   },
   "plugins": {

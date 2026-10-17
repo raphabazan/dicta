@@ -1,0 +1,230 @@
+   Compiling dicta v0.4.3 (C:\Users\rapha\dicta\dicta-app\src-tauri)
+warning: unnecessary `>= y + 1` or `x - 1 >=`
+   --> src\openai.rs:450:19
+    |
+450 |         } else if chunk.len() + sentence.len() + 1 <= 400 {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: change it to: `chunk.len() + sentence.len() < 400`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#int_plus_one
+    = note: `#[warn(clippy::int_plus_one)]` on by default
+
+warning: methods `build_stream_f32`, `build_stream_i16`, and `build_stream_u16` are never used
+   --> src\audio.rs:222:8
+    |
+106 | impl AudioRecorder {
+    | ------------------ methods in this implementation
+...
+222 |     fn build_stream_f32(
+    |        ^^^^^^^^^^^^^^^^
+...
+257 |     fn build_stream_i16(
+    |        ^^^^^^^^^^^^^^^^
+...
+283 |     fn build_stream_u16(
+    |        ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `TranscriptionResponse` is never constructed
+ --> src\openai.rs:5:12
+  |
+5 | pub struct TranscriptionResponse {
+  |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `post_process` is never used
+   --> src\openai.rs:121:18
+    |
+ 30 | impl OpenAIClient {
+    | ----------------- method in this implementation
+...
+121 |     pub async fn post_process(&self, raw_text: &str) -> Result<String, String> {
+    |                  ^^^^^^^^^^^^
+
+warning: method `close` is never used
+   --> src\realtime.rs:229:18
+    |
+ 74 | impl RealtimeSession {
+    | -------------------- method in this implementation
+...
+229 |     pub async fn close(&self) -> Result<(), String> {
+    |                  ^^^^^
+
+warning: methods `delete_transcription`, `count_transcriptions`, and `clear_transcriptions` are never used
+   --> src\db.rs:207:12
+    |
+ 49 | impl Database {
+    | ------------- methods in this implementation
+...
+207 |     pub fn delete_transcription(&self, id: i64) -> Result<()> {
+    |            ^^^^^^^^^^^^^^^^^^^^
+...
+218 |     pub fn count_transcriptions(&self) -> Result<i64> {
+    |            ^^^^^^^^^^^^^^^^^^^^
+...
+318 |     pub fn clear_transcriptions(&self) -> Result<()> {
+    |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: manual implementation of `.is_multiple_of()`
+   --> src\audio.rs:374:58
+    |
+374 |                         } else if native_rate > 24000 && native_rate % 24000 == 0 {
+    |                                                          ^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `native_rate.is_multiple_of(24000)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#manual_is_multiple_of
+    = note: `#[warn(clippy::manual_is_multiple_of)]` on by default
+
+warning: using `clone` on type `Option<bool>` which implements the `Copy` trait
+  --> src\system_audio.rs:45:9
+   |
+45 |         guard.clone()
+   |         ^^^^^^^^^^^^^ help: try dereferencing it: `*guard`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#clone_on_copy
+   = note: `#[warn(clippy::clone_on_copy)]` on by default
+
+warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+ --> src\queue.rs:8:48
+  |
+8 | pub fn save_audio_to_wav(audio: Vec<f32>, dir: &PathBuf) -> Result<PathBuf, String> {
+  |                                                ^^^^^^^^ help: change this to: `&Path`
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#ptr_arg
+  = note: `#[warn(clippy::ptr_arg)]` on by default
+
+warning: writing `&PathBuf` instead of `&Path` involves a new object where a slice will do
+  --> src\queue.rs:67:68
+   |
+67 | pub fn save_audio_i16_to_wav(audio: &[i16], sample_rate: u32, dir: &PathBuf) -> Result<PathBuf, String> {
+   |                                                                    ^^^^^^^^ help: change this to: `&Path`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#ptr_arg
+
+warning: used consecutive `str::replace` call
+    --> src\lib.rs:1158:29
+     |
+1158 |     let single_line = error.replace('\r', " ").replace('\n', " ");
+     |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `replace(['\r', '\n'], " ")`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#collapsible_str_replace
+     = note: `#[warn(clippy::collapsible_str_replace)]` on by default
+
+warning: using `clone` on type `Option<Instant>` which implements the `Copy` trait
+    --> src\lib.rs:1615:49
+     |
+1615 |                 let transcription_before_stop = last_transcription_time_for_stop.lock().unwrap().clone();
+     |                                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try dereferencing it: `*last_transcription_time_for_stop.lock().unwrap()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#clone_on_copy
+
+warning: using `clone` on type `Option<Instant>` which implements the `Copy` trait
+    --> src\lib.rs:1630:52
+     |
+1630 |                         let latest_transcription = last_transcription_time_for_stop.lock().unwrap().clone();
+     |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try dereferencing it: `*last_transcription_time_for_stop.lock().unwrap()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#clone_on_copy
+
+warning: using `clone` on type `Option<Instant>` which implements the `Copy` trait
+    --> src\lib.rs:1744:37
+     |
+1744 |         let transcription_at_stop = state.last_transcription_time.lock().unwrap().clone();
+     |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try dereferencing it: `*state.last_transcription_time.lock().unwrap()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#clone_on_copy
+
+warning: using `clone` on type `Option<Instant>` which implements the `Copy` trait
+    --> src\lib.rs:1753:30
+     |
+1753 |                 let latest = state.last_transcription_time.lock().unwrap().clone();
+     |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try dereferencing it: `*state.last_transcription_time.lock().unwrap()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#clone_on_copy
+
+warning: this `if let` can be collapsed into the outer `if let`
+    --> src\lib.rs:2400:45
+     |
+2400 | / ...                   if let Some(monitor) = monitor {
+2401 | | ...                       let screen_size = monitor.size();
+2402 | | ...                       let widget_width = 155;
+2403 | | ...                       let widget_height = 120; // Height increased for combo box
+...    |
+2409 | | ...                       let _ = widget.set_position(PhysicalPosition::new(x, y));
+2410 | | ...                   }
+     | |_______________________^
+     |
+help: the outer pattern can be modified to include the inner pattern
+    --> src\lib.rs:2399:51
+     |
+2399 | ...                   if let Ok(monitor) = widget.current_monitor() {
+     |                                 ^^^^^^^ replace this binding
+2400 | ...                       if let Some(monitor) = monitor {
+     |                                  ^^^^^^^^^^^^^ with this pattern
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#collapsible_match
+     = note: `#[warn(clippy::collapsible_match)]` on by default
+
+warning: this `if let` can be collapsed into the outer `if let`
+    --> src\lib.rs:2455:45
+     |
+2455 | / ...                   if let Some(monitor) = monitor {
+2456 | | ...                       let screen_size = monitor.size();
+2457 | | ...                       let widget_width = 155;
+2458 | | ...                       let widget_height = 120; // Height increased for combo box
+...    |
+2464 | | ...                       let _ = widget.set_position(PhysicalPosition::new(x, y));
+2465 | | ...                   }
+     | |_______________________^
+     |
+help: the outer pattern can be modified to include the inner pattern
+    --> src\lib.rs:2454:51
+     |
+2454 | ...                   if let Ok(monitor) = widget.current_monitor() {
+     |                                 ^^^^^^^ replace this binding
+2455 | ...                       if let Some(monitor) = monitor {
+     |                                  ^^^^^^^^^^^^^ with this pattern
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#collapsible_match
+
+warning: this `if let` can be collapsed into the outer `if let`
+    --> src\lib.rs:2513:45
+     |
+2513 | / ...                   if let Some(monitor) = monitor {
+2514 | | ...                       let screen_size = monitor.size();
+2515 | | ...                       let widget_width = 155;
+2516 | | ...                       let widget_height = 120; // Height increased for combo box
+...    |
+2522 | | ...                       let _ = widget.set_position(PhysicalPosition::new(x, y));
+2523 | | ...                   }
+     | |_______________________^
+     |
+help: the outer pattern can be modified to include the inner pattern
+    --> src\lib.rs:2512:51
+     |
+2512 | ...                   if let Ok(monitor) = widget.current_monitor() {
+     |                                 ^^^^^^^ replace this binding
+2513 | ...                       if let Some(monitor) = monitor {
+     |                                  ^^^^^^^^^^^^^ with this pattern
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#collapsible_match
+
+warning: this `if let` can be collapsed into the outer `if let`
+    --> src\lib.rs:2554:33
+     |
+2554 | / ...                   if let Some(monitor) = monitor {
+2555 | | ...                       let screen_size = monitor.size();
+2556 | | ...                       let win_width = 400i32;
+2557 | | ...                       let win_height = 160i32;
+...    |
+2560 | | ...                       let _ = prompt_window.set_position(PhysicalPosition::new(x, y));
+2561 | | ...                   }
+     | |_______________________^
+     |
+help: the outer pattern can be modified to include the inner pattern
+    --> src\lib.rs:2553:39
+     |
+2553 | ...                   if let Ok(monitor) = prompt_window.current_monitor() {
+     |                                 ^^^^^^^ replace this binding
+2554 | ...                       if let Some(monitor) = monitor {
+     |                                  ^^^^^^^^^^^^^ with this pattern
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.93.0/index.html#collapsible_match
+
+warning: `dicta` (lib test) generated 19 warnings (3 duplicates) (run `cargo clippy --fix --lib -p dicta --tests` to apply 7 suggestions)
+warning: `dicta` (lib) generated 19 warnings (16 duplicates) (run `cargo clippy --fix --lib -p dicta` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 49.57s

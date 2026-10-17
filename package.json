@@ -1,21 +1,22 @@
 {
   "name": "dicta",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "Smart voice-to-text dictation tool with AI post-processing",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "node --test scripts/*.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",
     "@tauri-apps/plugin-clipboard-manager": "^2.0.0",
     "@tauri-apps/plugin-global-shortcut": "^2.0.0",
+    "@tauri-apps/plugin-process": "^2.0.0",
     "@tauri-apps/plugin-shell": "^2.0.0",
     "@tauri-apps/plugin-updater": "^2.0.0",
-    "@tauri-apps/plugin-process": "^2.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
@@ -27,9 +28,7 @@
     "@vitejs/plugin-react": "^4.3.4",
     "autoprefixer": "^10.4.20",
     "postcss": "^8.4.49",
-    "sharp": "^0.34.5",
     "tailwindcss": "^3.4.17",
-    "to-ico": "^1.1.5",
     "typescript": "^5.7.2",
     "vite": "^6.0.5"
   }

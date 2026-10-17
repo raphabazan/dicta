@@ -1,304 +1,245 @@
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TranscriptionResponse {
-    pub text: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct VerboseTranscriptionResponse {
-    pub text: String,
-    #[serde(default)]
-    pub words: Vec<WordSegment>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WordSegment {
-    pub word: String,
-    pub start: f64,
-    pub end: f64,
-    #[serde(default)]
-    pub probability: Option<f64>,
-}
+use serde_json::{json, Value};
+use std::time::{Duration, Instant};
 
 pub struct OpenAIClient {
     api_key: String,
     client: reqwest::Client,
 }
 
+pub fn api_error(status: u16, value: &Value) -> String {
+    let code = value["error"]["code"]
+        .as_str()
+        .or_else(|| value["error"]["type"].as_str())
+        .unwrap_or("api_error");
+    let safe: String = code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take(80)
+        .collect();
+    format!("API error ({status}): {safe}")
+}
+pub fn retryable(status: u16, value: &Value) -> bool {
+    let code = value["error"]["code"].as_str().unwrap_or("");
+    (status == 429 && !["insufficient_quota", "billing_hard_limit_reached"].contains(&code))
+        || (500..=599).contains(&status)
+}
+pub fn transcription_text(value: &Value) -> Result<String, String> {
+    // The canonical text keeps punctuation and works without word timestamps.
+    value["text"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "empty_transcription".into())
+}
+pub fn response_text(value: &Value) -> Result<String, String> {
+    if value["status"].as_str().is_some_and(|s| s != "completed") {
+        return Err("incomplete_response".into());
+    }
+    let blocks: Vec<&str> = value["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|v| v["type"] == "message")
+        .flat_map(|v| v["content"].as_array().into_iter().flatten())
+        .filter(|v| v["type"] == "output_text")
+        .filter_map(|v| v["text"].as_str())
+        .collect();
+    let text = if blocks.is_empty() {
+        value["output_text"].as_str().unwrap_or("").to_string()
+    } else {
+        blocks.join("\n")
+    };
+    if text.trim().is_empty() {
+        Err("empty_response".into())
+    } else {
+        Ok(text.trim().into())
+    }
+}
+
 impl OpenAIClient {
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(90))
+                .build()
+                .expect("HTTP client initialization"),
         }
     }
-
-    /// Transcribe audio using Whisper API with confidence filtering
     pub async fn transcribe_audio(
         &self,
-        audio_data: Vec<f32>,
-        sample_rate: u32,
-        language_hint: Option<&str>,
-        prompt_hint: Option<&str>,
+        audio: Vec<f32>,
+        rate: u32,
+        language: Option<&str>,
+        hint: Option<&str>,
     ) -> Result<String, String> {
-        println!("🔄 Transcribing audio... ({} samples at {}Hz)", audio_data.len(), sample_rate);
-
-        // Convert f32 audio to WAV format
-        let wav_data = self.audio_to_wav(audio_data, sample_rate)?;
-
-        // Call Whisper API with optional language guidance and verbose_json for word-level confidence
-        let mut form = reqwest::multipart::Form::new()
-            .text("model", "whisper-1")
-            .text("response_format", "verbose_json")
-            .text("timestamp_granularities[]", "word")
-            .part(
-                "file",
-                reqwest::multipart::Part::bytes(wav_data)
-                    .file_name("audio.wav")
-                    .mime_str("audio/wav")
-                    .map_err(|e| format!("Failed to create multipart: {}", e))?,
-            );
-
-        if let Some(language) = language_hint {
-            form = form.text("language", language.to_string());
-        }
-
-        if let Some(prompt) = prompt_hint {
-            form = form.text("prompt", prompt.to_string());
-        }
-
-        let response = self
-            .client
-            .post("https://api.openai.com/v1/audio/transcriptions")
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .multipart(form)
-            .send()
+        let languages = language.into_iter().map(str::to_string).collect::<Vec<_>>();
+        self.transcribe_with_model(audio, rate, "whisper-1", &languages, hint)
             .await
-            .map_err(|e| format!("Failed to send request: {}", e))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(format!("API error ({}): {}", status, error_text));
+    }
+    pub async fn transcribe_with_model(
+        &self,
+        audio: Vec<f32>,
+        rate: u32,
+        model: &str,
+        languages: &[String],
+        hint: Option<&str>,
+    ) -> Result<String, String> {
+        if !["whisper-1", "gpt-transcribe"].contains(&model) {
+            return Err("unsupported_transcription_model".into());
         }
-
-        let result: VerboseTranscriptionResponse = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-        // Filter words by confidence threshold (0.7 = 70%)
-        let confidence_threshold = 0.7;
-        let filtered_words: Vec<String> = result.words
-            .iter()
-            .filter(|w| {
-                if let Some(prob) = w.probability {
-                    if prob < confidence_threshold {
-                        println!("⚠️ Low confidence ({:.2}%): '{}'", prob * 100.0, w.word);
-                        false
-                    } else {
-                        true
-                    }
-                } else {
-                    true // Keep if no probability (fallback)
+        if rate == 0 || audio.is_empty() {
+            return Err("empty_audio".into());
+        }
+        let wav = self.audio_to_wav(audio, rate)?;
+        if wav.len() > 25_000_000 {
+            return Err("audio_too_large".into());
+        }
+        let start = Instant::now();
+        for attempt in 0..3 {
+            let mut form = reqwest::multipart::Form::new()
+                .text("model", model.to_string())
+                .text("response_format", "json")
+                .part(
+                    "file",
+                    reqwest::multipart::Part::bytes(wav.clone())
+                        .file_name("segment.wav")
+                        .mime_str("audio/wav")
+                        .map_err(|_| "audio_multipart".to_string())?,
+                );
+            if model == "gpt-transcribe" {
+                for language in languages {
+                    form = form.text("languages[]", language.clone());
                 }
-            })
-            .map(|w| w.word.clone())
+            } else if languages.len() == 1 {
+                form = form.text("language", languages[0].clone());
+            }
+            if let Some(hint) = hint {
+                form = form.text("prompt", hint.to_string());
+            }
+            let response = self
+                .client
+                .post("https://api.openai.com/v1/audio/transcriptions")
+                .bearer_auth(&self.api_key)
+                .multipart(form)
+                .send()
+                .await
+                .map_err(|e| {
+                    if e.is_timeout() {
+                        "api_timeout".into()
+                    } else {
+                        "api_connection".to_string()
+                    }
+                })?;
+            let status = response.status().as_u16();
+            let request_id = response
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let value: Value = response
+                .json()
+                .await
+                .map_err(|_| "api_invalid_json".to_string())?;
+            crate::diagnostics::event(
+                "asr_request",
+                json!({"model":model,"attempt":attempt,"status":status,"request_id":request_id,"elapsed_ms":start.elapsed().as_millis()}),
+            );
+            if status < 300 {
+                return transcription_text(&value);
+            }
+            if attempt < 2 && retryable(status, &value) {
+                tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+                continue;
+            }
+            return Err(api_error(status, &value));
+        }
+        Err("api_retry_exhausted".into())
+    }
+    pub async fn send_prompt(
+        &self,
+        prompt: &str,
+        model: &str,
+        history: &[crate::db::ConversationMessage],
+        image: Option<&str>,
+    ) -> Result<String, String> {
+        self.send_prompt_options(prompt, model, history, image, false)
+            .await
+    }
+    pub async fn send_prompt_options(
+        &self,
+        prompt: &str,
+        model: &str,
+        history: &[crate::db::ConversationMessage],
+        image: Option<&str>,
+        web_search: bool,
+    ) -> Result<String, String> {
+        let model = if model == "gpt-4o" { "gpt-5.4" } else { model };
+        if !["gpt-5.4", "gpt-6.1-sol", "gpt-4o-mini"].contains(&model) {
+            return Err("unsupported_prompt_model".into());
+        }
+        let mut input: Vec<Value> = history
+            .iter()
+            .map(|msg| json!({"role":msg.role,"content":msg.content}))
             .collect();
-
-        let filtered_text = filtered_words.join(" ");
-
-        println!("📊 Original: {} words", result.words.len());
-        println!("📊 Filtered: {} words (threshold: {:.0}%)", filtered_words.len(), confidence_threshold * 100.0);
-        println!("✅ Transcription: {}", filtered_text);
-
-        Ok(filtered_text)
-    }
-
-    /// Post-process text with GPT-4o-mini
-    pub async fn post_process(&self, raw_text: &str) -> Result<String, String> {
-        println!("🤖 Post-processing with GPT-4o-mini...");
-
-        let prompt = format!(
-            "You are a text post-processor. Clean up this voice transcription:\n\
-            - Fix grammar and punctuation\n\
-            - Remove filler words (um, uh, like, you know)\n\
-            - DO NOT change the meaning\n\
-            - Output ONLY the cleaned text, nothing else\n\n\
-            Raw transcript: {}",
-            raw_text
-        );
-
-        let body = json!({
-            "model": "gpt-4o-mini",
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant that cleans up voice transcriptions."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.3
-        });
-
-        let response = self
-            .client
-            .post("https://api.openai.com/v1/chat/completions")
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to send request: {}", e))?;
-
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(format!("API error: {}", error_text));
-        }
-
-        let result: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-        let processed_text = result["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-
-        println!("✅ Processed text: {}", processed_text);
-        Ok(processed_text)
-    }
-
-    /// Send prompt to GPT model and get response with web search enabled
-    /// history: previous (user, assistant) pairs in chronological order
-    pub async fn send_prompt(&self, prompt: &str, model: &str, history: &[crate::db::ConversationMessage], image_data: Option<&str>) -> Result<String, String> {
-        println!("🤖 Sending prompt to {} (history: {} messages, image: {})...", model, history.len(), image_data.is_some());
-        println!("📝 Prompt: {}", prompt);
-
-        // Map model names to their correct identifiers
-        let api_model = match model {
-            "gpt-4o-mini" => "gpt-4o-mini",
-            "gpt-4o" => "gpt-5.4",
-            "gpt-5.4" => "gpt-5.4",
-            _ => model
-        };
-
-        let system_prompt = "You are a helpful assistant. When the user asks you to write, rewrite, translate, or improve a message, email, or text, respond with ONLY the final text, no introduction, no explanation. If the request is a question or needs an explanation, answer normally. Never use markdown formatting in your responses. Never use em dashes in your responses.";
-
-        // Build input array: history messages + current prompt
-        let mut input: Vec<serde_json::Value> = history.iter().map(|msg| {
-            json!({
-                "role": msg.role,
-                "content": msg.content
-            })
-        }).collect();
-
-        // Build user message: multimodal if image attached, plain text otherwise
-        if let Some(img) = image_data {
-            let mut content = vec![
-                json!({"type": "input_text", "text": prompt})
-            ];
-            // Add image with data URI
-            let image_url = if img.starts_with("data:") {
-                img.to_string()
+        if let Some(image) = image {
+            let url = if image.starts_with("data:") {
+                image.to_string()
             } else {
-                format!("data:image/png;base64,{}", img)
+                format!("data:image/png;base64,{image}")
             };
-            content.push(json!({"type": "input_image", "image_url": image_url}));
-            input.push(json!({
-                "role": "user",
-                "content": content
-            }));
-            println!("🖼️ Image attached ({} bytes base64)", img.len());
+            input.push(json!({"role":"user","content":[{"type":"input_text","text":prompt},{"type":"input_image","image_url":url}]}));
         } else {
-            input.push(json!({
-                "role": "user",
-                "content": prompt
-            }));
+            input.push(json!({"role":"user","content":prompt}));
         }
-
-        let body = json!({
-            "model": api_model,
-            "tools": [
-                {"type": "web_search"}
-            ],
-            "tool_choice": "auto",
-            "instructions": system_prompt,
-            "input": input
-        });
-
+        let mut body = json!({"model":model,"store":false,"instructions":"You are a helpful assistant. When asked to write, rewrite, translate, or improve a message, email, or text, respond with ONLY the final text. For questions, answer normally. Never use markdown formatting or em dashes.","input":input});
+        if model == "gpt-6.1-sol" {
+            body["reasoning"] = json!({"effort":"low"});
+        }
+        if web_search {
+            body["tools"] = json!([{"type":"web_search"}]);
+            body["tool_choice"] = json!("auto");
+        }
+        let start = Instant::now();
+        // No blind command retry: an ambiguous response may already have incurred work.
         let response = self
             .client
             .post("https://api.openai.com/v1/responses")
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
+            .bearer_auth(&self.api_key)
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("Failed to send request: {}", e))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(format!("API error ({}): {}", status, error_text));
-        }
-
-        let result: serde_json::Value = response
+            .map_err(|e| {
+                if e.is_timeout() {
+                    "api_timeout".into()
+                } else {
+                    "api_connection".to_string()
+                }
+            })?;
+        let status = response.status().as_u16();
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let value: Value = response
             .json()
             .await
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-        // Log if web search was used
-        if let Some(outputs) = result["output"].as_array() {
-            for output in outputs {
-                if output["type"] == "web_search_call" {
-                    println!("🌐 Web search was used for this query");
-                    if let Some(action) = output.get("action") {
-                        println!("🔍 Search action: {:?}", action);
-                    }
-                }
-            }
+            .map_err(|_| "api_invalid_json".to_string())?;
+        crate::diagnostics::event(
+            "prompt_request",
+            json!({"model":model,"status":status,"request_id":request_id,"elapsed_ms":start.elapsed().as_millis(),"input_tokens":value["usage"]["input_tokens"],"output_tokens":value["usage"]["output_tokens"]}),
+        );
+        if status >= 300 {
+            return Err(api_error(status, &value));
         }
-
-        // Extract output_text from Responses API response
-        let response_text = result["output_text"]
-            .as_str()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-
-        if response_text.is_empty() {
-            // Fallback: try to extract from output array
-            if let Some(outputs) = result["output"].as_array() {
-                for output in outputs {
-                    if output["type"] == "message" {
-                        if let Some(content) = output["content"].as_array() {
-                            for item in content {
-                                if item["type"] == "output_text" {
-                                    let text = item["text"].as_str().unwrap_or("").trim();
-                                    if !text.is_empty() {
-                                        println!("✅ Response from {} (web search): {}", model, text);
-                                        return Ok(text.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            return Err("No response text found in API response".to_string());
-        }
-
-        println!("✅ Response from {} (web search): {}", model, response_text);
-        Ok(response_text)
+        response_text(&value)
     }
 
     /// Generate speech audio from text using OpenAI TTS API
     pub async fn speak_text(&self, text: &str) -> Result<Vec<u8>, String> {
-        let preview: String = text.chars().take(80).collect();
-        println!("🔊 Generating TTS for: {}...", preview);
-
         let body = json!({
             "model": "tts-1",
             "input": text,
@@ -318,8 +259,8 @@ impl OpenAIClient {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(format!("TTS API error ({}): {}", status, error_text));
+            let error = response.json().await.unwrap_or_default();
+            return Err(api_error(status.as_u16(), &error));
         }
 
         let bytes = response
@@ -334,8 +275,15 @@ impl OpenAIClient {
     fn audio_to_wav(&self, audio_data: Vec<f32>, sample_rate: u32) -> Result<Vec<u8>, String> {
         use std::io::Cursor;
 
-        println!("🎵 Converting audio: {} samples @ {}Hz", audio_data.len(), sample_rate);
-        println!("🎵 Duration: {:.2}s", audio_data.len() as f32 / sample_rate as f32);
+        println!(
+            "🎵 Converting audio: {} samples @ {}Hz",
+            audio_data.len(),
+            sample_rate
+        );
+        println!(
+            "🎵 Duration: {:.2}s",
+            audio_data.len() as f32 / sample_rate as f32
+        );
 
         const TARGET_SAMPLE_RATE: u32 = 16_000;
 
@@ -464,10 +412,65 @@ pub fn split_into_tts_chunks(text: &str) -> Vec<String> {
         chunks.push(text.to_string());
     }
 
-    println!("📝 TTS chunks: {} chunks from {} chars", chunks.len(), text.len());
+    println!(
+        "📝 TTS chunks: {} chunks from {} chars",
+        chunks.len(),
+        text.len()
+    );
     for (i, c) in chunks.iter().enumerate() {
         println!("  Chunk {}: {} chars", i + 1, c.len());
     }
 
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn text_without_words_keeps_punctuation() {
+        assert_eq!(
+            transcription_text(&json!({"text":"Olá, Rapha. Não, trinta!"})).unwrap(),
+            "Olá, Rapha. Não, trinta!"
+        );
+    }
+    #[test]
+    fn empty_transcripts_are_failures() {
+        assert!(transcription_text(&json!({"text":" "})).is_err());
+    }
+    #[test]
+    fn all_output_blocks_are_preserved() {
+        assert_eq!(response_text(&json!({"status":"completed","output":[{"type":"reasoning","content":[]},{"type":"message","content":[{"type":"output_text","text":"Primeiro."},{"type":"output_text","text":"Segundo."}]}]})).unwrap(),"Primeiro.\nSegundo.");
+    }
+    #[test]
+    fn incomplete_response_is_not_delivered() {
+        assert!(response_text(&json!({"status":"incomplete","output_text":"partial"})).is_err());
+    }
+    #[test]
+    fn quota_and_auth_are_not_retried() {
+        assert!(!retryable(
+            429,
+            &json!({"error":{"code":"insufficient_quota"}})
+        ));
+        assert!(!retryable(401, &json!({})));
+        assert!(retryable(503, &json!({})));
+    }
+    #[test]
+    fn api_errors_never_include_secret_messages() {
+        let e = api_error(
+            401,
+            &json!({"error":{"code":"invalid_api_key","message":"secret token"}}),
+        );
+        assert!(!e.contains("secret"));
+    }
+    #[test]
+    fn wav_resampling_preserves_duration() {
+        let client = OpenAIClient::new("test".into());
+        for rate in [16000, 44100, 48000] {
+            let bytes = client.audio_to_wav(vec![0.1; rate as usize], rate).unwrap();
+            let reader = hound::WavReader::new(std::io::Cursor::new(bytes)).unwrap();
+            assert_eq!(reader.spec().sample_rate, 16000);
+            assert!((reader.duration() as i64 - 16000).abs() <= 1);
+        }
+    }
 }

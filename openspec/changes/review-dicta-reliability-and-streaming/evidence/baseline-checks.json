@@ -1,0 +1,39 @@
+{
+  "captured_at": "2026-10-17T13:15:55.371Z",
+  "frontend_build": {
+    "command": "rtk npm run build",
+    "exit": 0,
+    "modules": 53
+  },
+  "rust_tests": {
+    "command": "rtk cargo test --locked --offline",
+    "exit": 0,
+    "tests": 0,
+    "suites": 3
+  },
+  "full_npm_audit": {
+    "exit": 1,
+    "vulnerabilities": {
+      "info": 0,
+      "low": 1,
+      "moderate": 9,
+      "high": 15,
+      "critical": 5,
+      "total": 30
+    }
+  },
+  "production_npm_audit": {
+    "exit": 0,
+    "total": 0
+  },
+  "regression_harness": {
+    "expected_exit": 101,
+    "passed": 1,
+    "failed": 3,
+    "scope": "source functions with fake clipboard and keyboard; Enigo Drop modeled after checked dependency; not native Windows integration"
+  },
+  "clippy": {
+    "exit": 0,
+    "warnings": 19
+  }
+}

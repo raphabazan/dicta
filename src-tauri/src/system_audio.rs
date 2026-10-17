@@ -1,6 +1,6 @@
 use std::sync::Mutex;
-use windows::Win32::Media::Audio::*;
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
 
 static WAS_MUTED_BEFORE: Mutex<Option<bool>> = Mutex::new(None);
@@ -32,7 +32,10 @@ pub fn mute_system_audio() -> Result<(), String> {
             .SetMute(true, std::ptr::null())
             .map_err(|e| format!("SetMute(true) failed: {}", e))?;
 
-        println!("🔇 System audio muted (was_muted_before={})", current_mute.as_bool());
+        println!(
+            "🔇 System audio muted (was_muted_before={})",
+            current_mute.as_bool()
+        );
         Ok(())
     }
 }
