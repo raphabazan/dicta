@@ -23,7 +23,7 @@ Após esse registro, Rapha autorizou o push e a release 0.5.0 para teste manual 
 
 | Verificação | Resultado | O que não comprova |
 |---|---|---|
-| Testes Rust no Windows | 33 passaram | Não exercitam colagem entre aplicativos nem retomada física |
+| Testes Rust no Windows | 34 passaram após a revisão pré-release | Não exercitam colagem entre aplicativos nem retomada física |
 | Testes de reconciliação do frontend | 5 passaram | Não substituem QA visual ou IPC completo |
 | Build TypeScript/Vite | Passou | Não confirma comportamento da janela nativa |
 | Build Tauri debug com frontend incorporado, sem bundle | Passou | Não instala nem valida o comportamento entre aplicativos |
@@ -36,6 +36,8 @@ Após esse registro, Rapha autorizou o push e a release 0.5.0 para teste manual 
 | API real com áudio sintético dedicado | Whisper e GPT-Transcribe retornaram transcrição; GPT-5.4 e GPT-6.1 responderam ao comando controlado | Não valida qualidade, p95, imagem, busca ou custo consolidado |
 
 Os testes Rust incluem preservação/concorrência do clipboard simulado, rollback de escrita, falha de injeção, rejeição de destino alterado, continuidade dos segmentos, silêncio digital, cauda, conversão 16/44,1/48 kHz, parsers, Unicode, exclusividade de claim, migrações 0/1/2/3, rollback de migração e sessão antiga. O cancelamento de jobs pendentes é testado para não aguardar o timeout de 90 s do provedor.
+
+Na revisão pré-release, uma sonda Windows reproduziu `PermissionDenied` ao chamar `sync_all` em um arquivo reaberto somente para leitura. O spool passou a reabrir o WAV com acesso de escrita antes da sincronização. Um teste adicional grava, sincroniza, renomeia e relê arquivos reais em 16/44,1/48 kHz, verificando duração e amostras. Esse caso não era coberto pelos 33 testes iniciais.
 
 O smoke de API usou uma única fixture sintética de 14,073 s. Tempos observados: Whisper 2.253 ms, GPT-Transcribe 1.745 ms; comando GPT-5.4 2.272 ms e GPT-6.1 Sol 2.234 ms. São quatro observações exploratórias, não uma comparação estatística. A qualidade da voz sintética não foi suficiente para concluir sobre precisão dos ASRs. Nenhuma gravação privada foi enviada.
 
@@ -63,3 +65,4 @@ Para uma futura atualização do instalado: encerrar o Dicta, copiar o perfil co
 - [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol), [GPT-Transcribe](https://developers.openai.com/api/docs/models/gpt-transcribe) e [deprecações](https://developers.openai.com/api/docs/deprecations).
 - [Microsoft: SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput): retorno informa eventos inseridos; UIPI e teclas já pressionadas afetam a injeção.
 - [Microsoft: EnumClipboardFormats](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enumclipboardformats): fim de enumeração e falha retornam zero e precisam ser distinguidos com GetLastError. Essa distinção foi implementada no snapshot.
+- [Microsoft: FlushFileBuffers](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers): a sincronização exige um handle aberto com acesso de escrita. O contrato do spool foi corrigido e recebeu teste real de filesystem antes da release.

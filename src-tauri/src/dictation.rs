@@ -10,7 +10,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
@@ -305,14 +305,7 @@ pub fn prepare(
     Ok((capture, interruption))
 }
 
-fn persist_segment(
-    ctx: &Context,
-    id: &str,
-    index: u32,
-    rate: u32,
-    segment: Segment,
-) -> Result<StoredSegment, String> {
-    let file = ctx.root.join(id).join(format!("segment-{index:04}.wav"));
+fn seal_wav(file: &Path, rate: u32, samples: &[f32]) -> Result<(), String> {
     let pending = file.with_extension("tmp");
     let mut writer = hound::WavWriter::create(
         &pending,
@@ -324,16 +317,31 @@ fn persist_segment(
         },
     )
     .map_err(|_| "spool_write".to_string())?;
-    for sample in &segment.samples {
+    for sample in samples {
         writer
             .write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
             .map_err(|_| "spool_write".to_string())?;
     }
     writer.finalize().map_err(|_| "spool_write".to_string())?;
-    File::open(&pending)
+    // FlushFileBuffers requires GENERIC_WRITE on Windows, including after finalize.
+    OpenOptions::new()
+        .write(true)
+        .open(&pending)
         .and_then(|f| f.sync_all())
         .map_err(|_| "spool_write".to_string())?;
-    fs::rename(&pending, &file).map_err(|_| "spool_write".to_string())?;
+    fs::rename(&pending, file).map_err(|_| "spool_write".to_string())?;
+    Ok(())
+}
+
+fn persist_segment(
+    ctx: &Context,
+    id: &str,
+    index: u32,
+    rate: u32,
+    segment: Segment,
+) -> Result<StoredSegment, String> {
+    let file = ctx.root.join(id).join(format!("segment-{index:04}.wav"));
+    seal_wav(&file, rate, &segment.samples)?;
     let row = StoredSegment {
         session_id: id.into(),
         index,
@@ -835,6 +843,30 @@ pub fn valid_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audio_spool_is_durable_and_readable_at_real_rates() {
+        let folder = std::env::temp_dir().join(format!("dicta-spool-{}", new_id()));
+        fs::create_dir(&folder).unwrap();
+        for rate in [16_000, 44_100, 48_000] {
+            let file = folder.join(format!("segment-{rate}.wav"));
+            let samples = vec![0.25f32; rate as usize];
+            seal_wav(&file, rate, &samples)
+                .expect("a sealed segment must be durable before upload");
+            assert!(!file.with_extension("tmp").exists());
+            let reader = hound::WavReader::open(&file).unwrap();
+            assert_eq!(reader.spec().sample_rate, rate);
+            assert_eq!(reader.spec().channels, 1);
+            assert_eq!(reader.duration(), rate);
+            let persisted = reader
+                .into_samples::<i16>()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(persisted.len(), samples.len());
+            assert_eq!(persisted[0], (0.25 * i16::MAX as f32) as i16);
+            fs::remove_file(file).unwrap();
+        }
+        fs::remove_dir(folder).unwrap();
+    }
     #[test]
     fn session_ids_cannot_escape_spool() {
         assert!(valid_id(&new_id()));
