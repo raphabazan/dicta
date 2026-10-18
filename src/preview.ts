@@ -31,7 +31,7 @@ const settings: Record<string, unknown> = {
   get_tts_enabled: false,
   get_user_prompt_model: "gpt-6.1-sol",
   get_selected_prompt_model: "transcribe-only",
-  get_build_info: "0.5.1 · prévia de desenvolvimento",
+  get_build_info: "0.5.2 · prévia de desenvolvimento",
   list_microphones: ["Microfone do sistema", "Microfone USB"],
   get_selected_microphone: "Microfone do sistema",
   get_shortcut_errors: [],
@@ -218,7 +218,8 @@ export async function call(
   ) {
     queue = [];
     emit("queue-updated", 0);
-  } else if (command === "copy_to_clipboard") return undefined;
+  } else if (command === "copy_to_clipboard")
+    return navigator.clipboard.writeText(String(args.text ?? ""));
   else if (command === "recover_runtime" || command === "stop_tts_playback")
     return undefined;
   else throw new Error(`Prévia sem ação: ${command}`);

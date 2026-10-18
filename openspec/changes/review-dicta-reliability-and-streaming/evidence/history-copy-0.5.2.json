@@ -1,0 +1,29 @@
+{
+  "scope": "Synthetic browser fixtures; production clipboard implementation unchanged",
+  "checks": {
+    "copyLongText": true,
+    "characters": 2340,
+    "closedAfterCopy": true,
+    "keyboardCopy": true,
+    "keyboardFocus": true,
+    "keyboardExpansion": true
+  },
+  "layouts": [
+    {
+      "horizontalOverflow": false,
+      "outerOverflow": false,
+      "size": {
+        "height": 600,
+        "width": 800
+      }
+    },
+    {
+      "horizontalOverflow": false,
+      "outerOverflow": false,
+      "size": {
+        "height": 640,
+        "width": 360
+      }
+    }
+  ]
+}

@@ -2,7 +2,7 @@
 
 Aplicativo Windows de ditado com Tauri 2, Rust e React. O backend local captura áudio, persiste sessões em SQLite e chama a API OpenAI diretamente. Não há servidor próprio intermediário.
 
-Versão: **0.5.1**. A interface foi reorganizada para priorizar a prévia, com histórico e fila compactos. O aceite de colagem entre aplicativos, hibernação e qualidade de fala real continua pendente; consulte [o change OpenSpec](openspec/changes/review-dicta-reliability-and-streaming/tasks.md).
+Versão: **0.5.2**. A interface foi reorganizada para priorizar a prévia, com histórico e fila compactos. O aceite de colagem entre aplicativos, hibernação e qualidade de fala real continua pendente; consulte [o change OpenSpec](openspec/changes/review-dicta-reliability-and-streaming/tasks.md).
 
 ## Ditado
 

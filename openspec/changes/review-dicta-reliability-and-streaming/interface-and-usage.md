@@ -30,3 +30,8 @@ Referências: [preços](https://developers.openai.com/api/docs/pricing), [GPT-6.
 - Testes de cache, entrada/saída, raciocínio, busca, duração, TTS Unicode, precisão e idempotência do ledger.
 - Migração de schema 4 para 5 em banco isolado e preservação de dados anteriores.
 - Build/testes/lint, smoke dos modelos e revisão visual/interação nas três dimensões, com fixtures sintéticas e sem documentos pessoais.
+# Copiar no histórico — 0.5.2
+
+Foram consideradas três posições: ao lado do horário, à direita da linha de metadados e somente ao passar o mouse. A segunda mantém o texto como foco, dá uma posição consistente à ação e funciona em janelas estreitas. O botão permanece visível, com ícone de 16 px, área de clique de 36 px, nome acessível e tooltip.
+
+A hierarquia de cada item fica: metadados e copiar; prévia e expansão; texto completo. O botão é separado do controle de expansão e copia o texto integral. O botão ao fim do texto expandido continua disponível para leituras longas. A confirmação usa o aviso existente de texto copiado.

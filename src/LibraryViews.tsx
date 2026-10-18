@@ -16,32 +16,49 @@ export function HistoryView({ app }: { app: Dicta }) {
       ) : (
         <div className="entry-list">
           {app.history.map((entry) => (
-            <details className="text-entry" key={entry.id}>
-              <summary>
-                <div className="entry-summary">
-                  <div className="entry-meta">
-                    <time>{dateTime(entry.timestamp)}</time>
-                    <span>{modelLabel(entry.model)}</span>
-                    {Boolean(entry.duration_ms) && (
-                      <span>{duration(entry.duration_ms!)}</span>
-                    )}
-                  </div>
-                  <p className="text-clamp">{entry.text}</p>
+            <article className="history-entry" key={entry.id}>
+              <div className="history-entry-heading">
+                <div className="entry-meta">
+                  <time>{dateTime(entry.timestamp)}</time>
+                  <span>{modelLabel(entry.model)}</span>
+                  {Boolean(entry.duration_ms) && (
+                    <span>{duration(entry.duration_ms!)}</span>
+                  )}
                 </div>
-                <span className="chevron" aria-hidden="true">
-                  ⌄
-                </span>
-              </summary>
-              <div className="entry-expanded">
-                <p className="preserve-text">{entry.text}</p>
                 <button
+                  type="button"
+                  className="quiet entry-copy"
+                  title="Copiar texto completo"
+                  aria-label={`Copiar texto de ${dateTime(entry.timestamp)}`}
                   disabled={app.pending.has("copy")}
                   onClick={() => void app.copy(entry.text)}
                 >
-                  Copiar texto
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <rect x="8" y="8" width="12" height="12" rx="2" />
+                    <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" />
+                  </svg>
                 </button>
               </div>
-            </details>
+              <details className="text-entry">
+                <summary>
+                  <div className="entry-summary">
+                    <p className="text-clamp">{entry.text}</p>
+                  </div>
+                  <span className="chevron" aria-hidden="true">
+                    ⌄
+                  </span>
+                </summary>
+                <div className="entry-expanded">
+                  <p className="preserve-text">{entry.text}</p>
+                  <button
+                    disabled={app.pending.has("copy")}
+                    onClick={() => void app.copy(entry.text)}
+                  >
+                    Copiar texto
+                  </button>
+                </div>
+              </details>
+            </article>
           ))}
         </div>
       )}
