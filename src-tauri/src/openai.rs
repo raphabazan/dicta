@@ -28,9 +28,7 @@ pub fn retryable(status: u16, value: &Value) -> bool {
 }
 pub fn transcription_text(value: &Value) -> Result<String, String> {
     // The canonical text keeps punctuation and works without word timestamps.
-    value["text"]
-        .as_str()
-        .map(str::trim)
+    Some(value["text"].as_str().ok_or("api_invalid_json")?.trim())
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .ok_or_else(|| "empty_transcription".into())

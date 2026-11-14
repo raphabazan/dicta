@@ -56,8 +56,9 @@ export function SessionPanel({ app }: { app: Dicta }) {
         )}
         {session.error && (
           <p className="notice">
-            O progresso disponível foi preservado. Confira a fila para
-            continuar.
+            {session.error === "no_speech" ? "Nenhuma fala detectada." :
+              session.error === "empty_transcription" ? "Um trecho ficou sem transcrição. Você pode copiar a prévia e retomar o áudio na fila." :
+              "O progresso disponível foi preservado. Confira a fila para continuar."}
           </p>
         )}
       </div>
@@ -83,12 +84,12 @@ export function SessionPanel({ app }: { app: Dicta }) {
           </select>
         </label>
         <div className="row gap control-actions">
-          {text && ready && (
+          {text && (ready || session.phase === "recoverable") && (
             <button
               disabled={pending.has("copy")}
               onClick={() => void app.copy(text)}
             >
-              Copiar texto
+              {ready ? "Copiar texto" : "Copiar prévia"}
             </button>
           )}
           {recording && (

@@ -380,6 +380,44 @@ fn update_preview(ctx: &Context, id: &str) -> Result<(), String> {
     });
     Ok(())
 }
+// Only digital silence (within one PCM16 quantization step) is conclusive.
+// Previously submitted overlap is not evidence of new speech.
+fn silent_payload(samples: &[f32], overlap: usize) -> bool {
+    samples
+        .iter()
+        .skip(overlap)
+        .all(|v| v.abs() <= 1.0 / 32768.0)
+}
+
+// A provider-confirmed blank trailing segment may contain the ADC noise floor.
+// Require both low peak and low mean power on previously unseen samples.
+fn quiet_empty_tail(samples: &[f32], overlap: usize, reason: &str) -> bool {
+    if !matches!(reason, "stop" | "recovery") {
+        return false;
+    }
+    let fresh = samples.get(overlap..).unwrap_or_default();
+    let mut power = 0.0_f64;
+    for sample in fresh {
+        let pcm = *sample as f64 * 32768.0;
+        if !pcm.is_finite() || pcm.abs() > 16.0 {
+            return false;
+        }
+        power += pcm * pcm;
+    }
+    power <= fresh.len() as f64 * 4.0
+}
+
+fn fallback_model<'a>(result: &Result<String, String>, model: &'a str) -> Option<&'a str> {
+    match result {
+        Err(e) if e == "empty_transcription" => Some(if model == "whisper-1" {
+            "gpt-transcribe"
+        } else {
+            model
+        }),
+        _ => None,
+    }
+}
+
 fn enqueue(
     jobs: &mut JoinSet<Result<(), String>>,
     ctx: Context,
@@ -401,17 +439,40 @@ fn enqueue(
             return Err(error);
         }
         let (samples, rate) = crate::queue::read_wav_to_f32_with_rate(&segment.path)?;
-        let text = ctx
-            .client
-            .for_source(&segment.session_id)
-            .transcribe_with_model(
-                samples,
-                rate,
-                &config.asr_model,
-                &config.languages,
-                config.hint.as_deref(),
-            )
-            .await;
+        let client = ctx.client.for_source(&segment.session_id);
+        let mut text = if silent_payload(&samples, segment.overlap_samples) {
+            Ok(String::new())
+        } else {
+            client
+                .transcribe_with_model(
+                    samples.clone(),
+                    rate,
+                    &config.asr_model,
+                    &config.languages,
+                    config.hint.as_deref(),
+                )
+                .await
+        };
+        if matches!(&text, Err(e) if e == "empty_transcription")
+            && quiet_empty_tail(&samples, segment.overlap_samples, &segment.reason)
+        {
+            diagnostics::event(
+                "asr_quiet_tail",
+                json!({"id":segment.session_id,"index":segment.index}),
+            );
+            text = Ok(String::new());
+        } else if let Some(model) = fallback_model(&text, &config.asr_model) {
+            if interruption.load(Ordering::Acquire) != 0 {
+                return Err("session_interrupted".into());
+            }
+            diagnostics::event(
+                "asr_empty_retry",
+                json!({"id":segment.session_id,"index":segment.index,"model":model}),
+            );
+            text = client
+                .transcribe_with_model(samples, rate, model, &config.languages, None)
+                .await;
+        }
         let text = match text {
             Ok(text) => text,
             Err(error) => {
@@ -625,6 +686,22 @@ async fn finalize(
         .map_err(|_| "session_storage".to_string())?
         .ok_or("session_missing")?;
     if text.trim().is_empty() && config.image_data.is_none() {
+        if config.input_text.is_none() {
+            // Only silent payloads or provider-confirmed quiet tails complete empty.
+            ctx.database
+                .update_session(id, "cancelled", record.duration_ms, "")
+                .map_err(|_| "session_storage".to_string())?;
+            ctx.database
+                .release_session(id)
+                .map_err(|_| "session_storage".to_string())?;
+            ctx.manager.update(&ctx.app, id, |s| {
+                s.phase = "cancelled".into();
+                s.error = Some("no_speech".into());
+            });
+            let _ = ctx.app.emit("sessions-updated", ());
+            cleanup(&ctx.root, id);
+            return Ok(None);
+        }
         return Err("empty_transcription".into());
     }
     let duration = record.duration_ms;
@@ -846,6 +923,34 @@ pub fn valid_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ignore_only_silent_new_audio_not_short_speech() {
+        assert!(silent_payload(&[0.5, 0.7, 0.0, -1.0 / 32768.0], 2));
+        assert!(!silent_payload(&[0.5, 0.7, 0.0002], 2));
+    }
+    #[test]
+    fn retry_empty_result_but_never_mask_a_request_failure() {
+        assert_eq!(
+            fallback_model(&Err("empty_transcription".into()), "whisper-1"),
+            Some("gpt-transcribe")
+        );
+        for code in ["api_timeout", "api_invalid_json", "api_connection"] {
+            assert_eq!(fallback_model(&Err(code.into()), "whisper-1"), None);
+        }
+        assert_eq!(fallback_model(&Ok(String::new()), "whisper-1"), None);
+    }
+    #[test]
+    fn quiet_tail_requires_low_peak_and_low_power_after_overlap() {
+        let mut samples = vec![0.2; 8000];
+        samples.extend(vec![1.0 / 32768.0; 18000]);
+        *samples.last_mut().unwrap() = 13.0 / 32768.0;
+        assert!(quiet_empty_tail(&samples, 8000, "stop"));
+        assert!(!quiet_empty_tail(&samples, 8000, "pause"));
+        assert!(!quiet_empty_tail(&samples, 0, "stop"));
+        assert!(!quiet_empty_tail(&[5.0 / 32768.0; 256], 0, "stop"));
+        *samples.last_mut().unwrap() = 30.0 / 32768.0;
+        assert!(!quiet_empty_tail(&samples, 8000, "stop"));
+    }
     #[test]
     fn audio_spool_is_durable_and_readable_at_real_rates() {
         let folder = std::env::temp_dir().join(format!("dicta-spool-{}", new_id()));

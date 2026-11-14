@@ -31,7 +31,7 @@ const settings: Record<string, unknown> = {
   get_tts_enabled: false,
   get_user_prompt_model: "gpt-6.1-sol",
   get_selected_prompt_model: "transcribe-only",
-  get_build_info: "0.5.2 · prévia de desenvolvimento",
+  get_build_info: "0.5.3 · prévia de desenvolvimento",
   list_microphones: ["Microfone do sistema", "Microfone USB"],
   get_selected_microphone: "Microfone do sistema",
   get_shortcut_errors: [],

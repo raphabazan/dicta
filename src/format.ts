@@ -34,6 +34,7 @@ export function modelLabel(model: string | null): string {
 }
 export function errorMessage(error: unknown): string {
   const text = String(error);
+  if (text.includes("empty_transcription")) return "O serviço não retornou texto para um trecho do áudio.";
   if (/insufficient_quota|billing_hard_limit/i.test(text))
     return "A chave da OpenAI está sem saldo ou limite disponível.";
   if (/invalid_api_key|401/i.test(text)) return "Verifique a chave da OpenAI.";
