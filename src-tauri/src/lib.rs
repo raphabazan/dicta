@@ -10,6 +10,7 @@ pub mod openai;
 mod queue;
 pub mod segmentation;
 mod system_audio;
+mod updates;
 mod usage;
 
 use std::path::PathBuf;
@@ -17,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State};
+use tauri::{AppHandle, Emitter, Listener, Manager, PhysicalPosition, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
 
@@ -99,6 +100,7 @@ fn toggle_recording_from_hotkey(app: AppHandle) {
 }
 
 struct AppState {
+    updates: updates::Manager,
     openai_client: Arc<openai::OpenAIClient>,
     database: Arc<db::Database>,
     sessions: Arc<dictation::Manager>,
@@ -446,6 +448,10 @@ async fn play_tts_chunked(
     _tts_stream_handle: Arc<Mutex<Option<rodio::OutputStreamHandle>>>,
     tts_active: Arc<Mutex<bool>>,
 ) {
+    let state = app.state::<AppState>();
+    let Ok(_activity) = state.updates.activity() else {
+        return;
+    };
     // Set active flag
     *tts_active.lock().unwrap() = true;
 
@@ -585,6 +591,7 @@ async fn start_recording_audio(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<String, String> {
+    let activity = state.updates.activity()?;
     let ctx = context(&state, app.clone());
     let id = dictation::new_id();
     let model = state
@@ -651,6 +658,7 @@ async fn start_recording_audio(
         state.tts_active.clone(),
     );
     tokio::spawn(async move {
+        let _activity = activity;
         let result = dictation::run(
             ctx.clone(),
             id.clone(),
@@ -786,6 +794,7 @@ async fn retry_session(
     app: AppHandle,
     id: String,
 ) -> Result<(), String> {
+    let _activity = state.updates.activity()?;
     if !dictation::valid_id(&id) {
         return Err("Sessão inválida.".into());
     }
@@ -820,6 +829,7 @@ async fn paste_last_transcription(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<delivery::Outcome, String> {
+    let activity = state.updates.activity()?;
     let text = state
         .database
         .load_latest_transcription()
@@ -827,9 +837,12 @@ async fn paste_last_transcription(
         .ok_or("Nenhuma transcrição disponível.")?
         .text;
     let target = delivery::capture_target();
-    tokio::task::spawn_blocking(move || delivery::deliver(&app, &text, target))
-        .await
-        .map_err(|_| "Falha na entrega.".into())
+    tokio::task::spawn_blocking(move || {
+        let _activity = activity;
+        delivery::deliver(&app, &text, target)
+    })
+    .await
+    .map_err(|_| "Falha na entrega.".into())
 }
 
 #[tauri::command]
@@ -875,6 +888,8 @@ fn get_transcription_history(
 
 #[tauri::command]
 fn copy_to_clipboard(app: AppHandle, text: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let _activity = state.updates.activity()?;
     app.clipboard()
         .write_text(text)
         .map_err(|e| format!("Failed to write to clipboard: {}", e))
@@ -1139,6 +1154,7 @@ async fn send_text_prompt(
     model: String,
     image_data: Option<String>,
 ) -> Result<(), String> {
+    let activity = state.updates.activity()?;
     let model = normalize_prompt_model(&model);
     if model == "transcribe-only" || (prompt.trim().is_empty() && image_data.is_none()) {
         return Err("Selecione um modelo e escreva um comando.".into());
@@ -1191,6 +1207,7 @@ async fn send_text_prompt(
         state.tts_active.clone(),
     );
     tokio::spawn(async move {
+        let _activity = activity;
         let result = dictation::run_text(&ctx, &id, &config, interruption, target).await;
         if let Err(error) = &result {
             dictation::fail(&ctx, &id, error, "recoverable");
@@ -1352,6 +1369,7 @@ async fn retry_single_queue_item(
     app: AppHandle,
     id: i64,
 ) -> Result<(), String> {
+    let activity = state.updates.activity()?;
     let database = state.database.clone();
     let openai = state.openai_client.clone();
     let last_transcription = state.last_transcription.clone();
@@ -1364,6 +1382,7 @@ async fn retry_single_queue_item(
         .ok_or_else(|| "Item não encontrado na fila".to_string())?;
 
     tokio::spawn(async move {
+        let _activity = activity;
         if !database.claim_queue_item(item.id, true).unwrap_or(false) {
             return;
         }
@@ -1378,6 +1397,7 @@ async fn retry_single_queue_item(
 
 #[tauri::command]
 async fn play_queue_audio(state: State<'_, AppState>, audio_path: String) -> Result<(), String> {
+    let activity = state.updates.activity()?;
     let path = std::fs::canonicalize(&audio_path).map_err(|_| "Áudio indisponível.".to_string())?;
     let root =
         std::fs::canonicalize(&state.queue_dir).map_err(|_| "Fila indisponível.".to_string())?;
@@ -1390,6 +1410,7 @@ async fn play_queue_audio(state: State<'_, AppState>, audio_path: String) -> Res
     }
     let sink_state = state.tts_sink.clone();
     std::thread::spawn(move || {
+        let _activity = activity;
         let result = (|| {
             let (_stream, handle) = rodio::OutputStream::try_default().map_err(|_| ())?;
             let file = std::fs::File::open(path).map_err(|_| ())?;
@@ -1573,6 +1594,10 @@ async fn process_retry_queue(
     app: AppHandle,
     include_blocked: bool,
 ) {
+    let state = app.state::<AppState>();
+    let Ok(_activity) = state.updates.activity() else {
+        return;
+    };
     let items = match database.load_queue() {
         Ok(items) => items,
         Err(e) => {
@@ -1707,6 +1732,7 @@ pub fn run() {
     let session_dir = app_data_dir.join("sessions");
     std::fs::create_dir_all(&session_dir).ok();
     let app_state = AppState {
+        updates: updates::Manager::default(),
         openai_client: Arc::new(
             openai::OpenAIClient::new(api_key).with_usage_store(database.clone()),
         ),
@@ -2028,7 +2054,12 @@ pub fn run() {
                         if let Some(state)=app.try_state::<AppState>() {
                             if let Ok(Some(entry))=state.database.load_latest_transcription(){
                                 let target=delivery::capture_target();let app=app.clone();
-                                std::thread::spawn(move||delivery::deliver(&app,&entry.text,target));
+                                if let Ok(activity) = state.updates.activity() {
+                                    std::thread::spawn(move || {
+                                        let _activity = activity;
+                                        delivery::deliver(&app, &entry.text, target)
+                                    });
+                                }
                             }
                         }
                     }
@@ -2038,6 +2069,7 @@ pub fn run() {
         )
         .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
+            updates::get_update_status, updates::check_updates,
             start_recording_audio,
             stop_recording_audio,
             cancel_recording,
@@ -2075,6 +2107,11 @@ pub fn run() {
         ])
         .setup(|app| {
             lifecycle::install(app.handle())?;
+            let update_app = app.handle().clone();
+            app.listen("runtime-resumed", move |_| {
+                update_app.state::<AppState>().updates.request_check();
+            });
+            updates::start(app.handle().clone());
             if cfg!(debug_assertions) && std::env::var_os("DICTA_SHOW_MAIN").is_some(){if let Some(w)=app.get_webview_window("main"){let _=w.set_title("Dicta — teste isolado");let _=w.show();}}
             if let Some(w)=app.get_webview_window("recording-widget"){let _=w.set_focusable(false);}
             // Create tray menu

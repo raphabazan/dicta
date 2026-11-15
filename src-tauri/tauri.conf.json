@@ -1,6 +1,6 @@
 {
   "productName": "Dicta",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "identifier": "com.dicta.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -138,10 +138,7 @@
             "core:tray:allow-new",
             "core:tray:allow-set-icon",
             "core:tray:allow-set-menu",
-            "core:tray:allow-set-tooltip",
-            "updater:allow-check",
-            "updater:allow-download-and-install",
-            "process:allow-restart"
+            "core:tray:allow-set-tooltip"
           ],
           "commands": {
             "allow": [

@@ -1,14 +1,12 @@
 import { useEffect, useState } from "react";
-import { check } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { useDicta } from "./useDicta";
 import { SessionPanel } from "./SessionPanel";
 import { HistoryView, QueueView } from "./LibraryViews";
 import { SettingsView } from "./SettingsView";
 import { UsageView } from "./UsageView";
-import { isPreview } from "./desktop";
+import { call, on, isPreview } from "./desktop";
+import { updateMessage, type UpdateStatus } from "./updates";
 import { sessionBusy, sessionLabel } from "./session";
-import { errorMessage } from "./format";
 
 const views = [
   {
@@ -25,42 +23,29 @@ type View = (typeof views)[number]["id"];
 export default function App() {
   const app = useDicta();
   const [view, setView] = useState<View>("home");
-  const [updateVersion, setUpdateVersion] = useState("");
-  const [updating, setUpdating] = useState(false);
-  const [updateProgress, setUpdateProgress] = useState("");
+  const [update, setUpdate] = useState<UpdateStatus>({ sequence: 0, phase: "", version: "" });
+  const updateText = updateMessage(update);
   const count = app.queue.length + app.recoveries.length;
   const busy = sessionBusy(app.session);
   useEffect(() => {
     if (isPreview) return;
     let disposed = false;
-    void check()
-      .then((update) => {
-        if (!disposed && update?.available) setUpdateVersion(update.version);
-      })
-      .catch(() => {});
+    let unlisten: (() => void) | undefined;
+    const receive = (next: UpdateStatus) => {
+      if (!disposed) setUpdate((current) => next.sequence >= current.sequence ? next : current);
+    };
+    void on<UpdateStatus>("update-state", receive).then(async (stop) => {
+      if (disposed) { stop(); return; }
+      unlisten = stop;
+      receive(await call<UpdateStatus>("get_update_status"));
+    }).catch(() => {
+      if (!disposed) setUpdate({ sequence: 0, phase: "error", version: "" });
+    });
     return () => {
       disposed = true;
+      unlisten?.();
     };
   }, []);
-  const applyUpdate = async () => {
-    setUpdating(true);
-    setUpdateProgress("Baixando atualização…");
-    try {
-      const update = await check();
-      if (update?.available) {
-        await update.downloadAndInstall((event) => {
-          if (event.event === "Finished") setUpdateProgress("Instalando…");
-        });
-        await relaunch();
-      } else {
-        setUpdateVersion("");
-        setUpdating(false);
-      }
-    } catch (reason) {
-      app.setError(errorMessage(reason));
-      setUpdating(false);
-    }
-  };
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -103,17 +88,14 @@ export default function App() {
           </button>
         ))}
       </nav>
-      {updateVersion && (
+      {updateText && (
         <div className="update-banner">
-          <p>
-            {updating ? updateProgress : `Dicta ${updateVersion} disponível`}
-          </p>
-          <button
-            disabled={updating || busy}
-            onClick={() => void applyUpdate()}
-          >
-            {busy ? "Após o ditado" : "Atualizar"}
-          </button>
+          <p role="status">{updateText}</p>
+          {update.phase === "error" && (
+            <button onClick={() => void call("check_updates").catch(() => app.setError("Não foi possível solicitar a atualização."))}>
+              Tentar agora
+            </button>
+          )}
         </div>
       )}
       {(app.error || app.message) && (
