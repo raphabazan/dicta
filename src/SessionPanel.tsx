@@ -57,6 +57,7 @@ export function SessionPanel({ app }: { app: Dicta }) {
         {session.error && (
           <p className="notice">
             {session.error === "no_speech" ? "Nenhuma fala detectada." :
+              session.error === "partial_transcription" ? "Prévia salva no histórico e disponível com Alt+Shift+Z. Retome o áudio na fila para completar o ditado." :
               session.error === "empty_transcription" ? "Um trecho ficou sem transcrição. Você pode copiar a prévia e retomar o áudio na fila." :
               "O progresso disponível foi preservado. Confira a fila para continuar."}
           </p>

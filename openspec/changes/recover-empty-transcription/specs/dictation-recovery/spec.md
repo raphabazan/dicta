@@ -9,7 +9,7 @@ The application SHALL distinguish digital silence from a provider returning an e
 
 #### Scenario: An unresolved segment remains
 - **WHEN** a second attempt does not yield text
-- **THEN** preserve the recording for recovery and allow the available preview to be copied without marking the session complete.
+- **THEN** preserve the recording for recovery. At the end of a transcription-only dictation, save the nonempty contiguous preview as partial history and attempt one paste using the original destination. Keep it available to the last-text shortcut. On successful recovery, promote the same history entry to the complete text without automatically pasting again. Interrupted sessions and command mode must not paste a partial result.
 
 #### Scenario: Empty response on a final segment at the microphone noise floor
 - **WHEN** the provider returns a valid empty text for a stop or recovery tail whose new PCM16 samples have peak amplitude at most 16 and RMS at most 2

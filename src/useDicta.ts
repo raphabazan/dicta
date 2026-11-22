@@ -92,6 +92,10 @@ export function useDicta() {
   }, []);
   const receiveSession = useCallback((next: SessionSnapshot) => {
     const accepted = reconcileSession(sessionRef.current, next);
+    if (accepted.generation > sessionRef.current.generation) {
+      setError("");
+      setMessage("");
+    }
     sessionRef.current = accepted;
     setSession(accepted);
   }, []);

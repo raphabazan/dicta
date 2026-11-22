@@ -215,6 +215,7 @@ fn error_code(error: &str) -> String {
         "api_timeout",
         "api_connection",
         "empty_transcription",
+        "partial_transcription",
         "audio_too_large",
         "capture_failed",
         "session_interrupted",
@@ -640,6 +641,29 @@ pub async fn run(
         return Ok(None);
     }
     if let Some(error) = first_error {
+        // Rebuild the ordered prefix after all workers have finished publishing.
+        update_preview(&ctx, &id)?;
+        let preview = ctx.manager.snapshot().text;
+        if config.prompt_model.is_none() && !preview.trim().is_empty() {
+            ctx.database
+                .save_result_once(&id, &preview, Some(duration), &config.asr_model, "partial")
+                .map_err(|_| "session_storage".to_string())?;
+            *ctx.last_text.lock().unwrap() = Some(preview.clone());
+            diagnostics::event(
+                "partial_transcription",
+                json!({"id":id,"cause":error_code(&error)}),
+            );
+            let _ = ctx.app.emit("history-updated", ());
+            fail(&ctx, &id, "partial_transcription", "recoverable");
+            let app = ctx.app.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if interruption.load(Ordering::Acquire) == 0 {
+                    delivery::deliver(&app, &preview, target);
+                }
+            })
+            .await;
+            return Ok(None);
+        }
         fail(&ctx, &id, &error, "recoverable");
         return Err(error);
     }

@@ -21,6 +21,7 @@ export function HistoryView({ app }: { app: Dicta }) {
                 <div className="entry-meta">
                   <time>{dateTime(entry.timestamp)}</time>
                   <span>{modelLabel(entry.model)}</span>
+                  {entry.mode === "partial" && <span>Prévia parcial</span>}
                   {Boolean(entry.duration_ms) && (
                     <span>{duration(entry.duration_ms!)}</span>
                   )}
@@ -28,7 +29,7 @@ export function HistoryView({ app }: { app: Dicta }) {
                 <button
                   type="button"
                   className="quiet entry-copy"
-                  title="Copiar texto completo"
+                  title={entry.mode === "partial" ? "Copiar prévia" : "Copiar texto completo"}
                   aria-label={`Copiar texto de ${dateTime(entry.timestamp)}`}
                   disabled={app.pending.has("copy")}
                   onClick={() => void app.copy(entry.text)}

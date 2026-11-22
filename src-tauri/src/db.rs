@@ -167,6 +167,24 @@ mod tests {
         assert_eq!(database.usage_summary(0, 1).unwrap().requests, 0);
     }
     #[test]
+    fn partial_history_is_available_to_paste_then_promoted_once_on_recovery() {
+        let db = Database::new(PathBuf::from(":memory:")).unwrap();
+        let save = |text, mode| {
+            db.save_result_once("session-1", text, Some(262820), "whisper-1", mode)
+                .unwrap()
+        };
+        save("dez trechos", "partial");
+        let preview = db.load_latest_transcription().unwrap().unwrap();
+        assert_eq!(preview.text, "dez trechos");
+        save("dez trechos e o final", "transcription");
+        save("prévia atrasada", "partial");
+        let entries = db.load_history_page(10, 0).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, preview.id);
+        assert_eq!(entries[0].text, "dez trechos e o final");
+        assert_eq!(entries[0].mode.as_deref(), Some("transcription"));
+    }
+    #[test]
     fn startup_preserves_unfinished_sessions_without_delivery() {
         let database = Database::new(PathBuf::from(":memory:")).unwrap();
         let session = SessionRecord {
@@ -815,7 +833,15 @@ impl Database {
         };
         // New results use the per-request ledger. Do not invent tokens from output text.
         let cost: Option<i64> = None;
-        self.conn.lock().unwrap().execute("INSERT OR IGNORE INTO transcriptions(text,timestamp,duration_ms,model,mode,source_id,cost_cents) VALUES (?1,?2,?3,?4,?5,?6,?7)",rusqlite::params![text,crate::now_ms(),duration,model,mode,source,cost])?;
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO transcriptions(text,timestamp,duration_ms,model,mode,source_id,cost_cents)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(source_id) WHERE source_id IS NOT NULL DO UPDATE SET
+                 text=excluded.text, timestamp=excluded.timestamp, duration_ms=excluded.duration_ms,
+                 model=excluded.model, mode=excluded.mode
+             WHERE transcriptions.mode='partial' AND excluded.mode!='partial'",
+            rusqlite::params![text, crate::now_ms(), duration, model, mode, source, cost],
+        )?;
         Ok(())
     }
     pub fn set_session_config(&self, id: &str, config: &str) -> Result<()> {

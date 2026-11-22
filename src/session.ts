@@ -35,6 +35,7 @@ export function sessionLabel(session: SessionSnapshot): string {
 }
 export function deliveryMessage(code: string): string {
   const messages: Record<string, string> = {
+    clipboard_snapshot: "O Windows não permitiu preservar a área de transferência. Use Alt+Shift+Z para tentar a colagem novamente.",
     shortcut_sent: "Atalho de colagem enviado. Se o texto não entrou, use Alt+Shift+Z.",
     destination_changed: "O destino mudou. Texto salvo; use Alt+Shift+Z no campo desejado.",
     destination_unavailable: "Texto pronto. Use Alt+Shift+Z no campo desejado ou copie abaixo.",
